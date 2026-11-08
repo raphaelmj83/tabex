@@ -5,6 +5,12 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versão a publicar (ex.: 0.1.0). Cria a tag v<versão> e a release."
+        required: true
+        default: "0.1.0"
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,11 +61,13 @@ jobs:
 
   release:
     name: Publicar release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -69,9 +77,13 @@ jobs:
           cd dist
           for d in */; do
             n="${d%/}"
-            (cd "$n" && zip -r "../$n.zip" .)
+            (cd "$n" && zip -r "../$n-$TAG.zip" .)
           done
           ls -la
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
+          name: Tabex ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
           files: dist/*.zip
