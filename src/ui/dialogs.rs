@@ -1,0 +1,563 @@
+use crate::app::{plural, Action, TabexApp};
+use crate::fs::entry::{format_date, format_size_human, thousands, FileEntry};
+use crate::fs::ops::{self, PropertiesInfo};
+use crate::model::color::GroupColor;
+use crate::shortcuts::HELP;
+use egui::{
+    vec2, Align, Button, Context, CornerRadius, Grid, Id, Key, Layout, Modal, RichText, Sense, Stroke, StrokeKind,
+    TextEdit, Ui,
+};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+pub enum Dialog {
+    None,
+    Rename {
+        path: PathBuf,
+        name: String,
+        is_dir: bool,
+        first: bool,
+    },
+    NewFolder {
+        dir: PathBuf,
+        name: String,
+        first: bool,
+    },
+    NewFile {
+        dir: PathBuf,
+        name: String,
+        first: bool,
+    },
+    ConfirmDelete {
+        paths: Vec<PathBuf>,
+        permanent: bool,
+    },
+    Group {
+        index: Option<usize>,
+        name: String,
+        color: GroupColor,
+        first: bool,
+    },
+    Properties {
+        paths: Vec<PathBuf>,
+        entry: Option<FileEntry>,
+        info: Arc<Mutex<PropertiesInfo>>,
+    },
+    Error {
+        title: String,
+        message: String,
+    },
+    Shortcuts,
+}
+
+enum Outcome {
+    Keep,
+    Close,
+}
+
+pub fn show(ctx: &Context, app: &mut TabexApp) {
+    if matches!(app.dialog, Dialog::None) {
+        return;
+    }
+    let mut dialog = std::mem::replace(&mut app.dialog, Dialog::None);
+    let mut actions: Vec<Action> = Vec::new();
+    let outcome = match &mut dialog {
+        Dialog::None => Outcome::Close,
+        Dialog::Rename {
+            path,
+            name,
+            is_dir,
+            first,
+        } => {
+            let path = path.clone();
+            let is_dir = *is_dir;
+            text_dialog(
+                ctx,
+                "Renomear",
+                if is_dir {
+                    "Novo nome da pasta:"
+                } else {
+                    "Novo nome do arquivo:"
+                },
+                name,
+                first,
+                !is_dir,
+                |name| match ops::rename(&path, name) {
+                    Ok(new_path) => {
+                        let parent = path.parent().map(|p| p.to_path_buf());
+                        if let Some(p) = parent {
+                            actions.push(Action::Navigate(p));
+                        }
+                        actions.push(Action::Toast(format!(
+                            "Renomeado para \"{}\"",
+                            new_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        )));
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+            )
+        }
+        Dialog::NewFolder { dir, name, first } => {
+            let dir = dir.clone();
+            text_dialog(ctx, "Nova pasta", "Nome da pasta:", name, first, false, |name| {
+                ops::create_folder(&dir, name)
+                    .map(|_| actions.push(Action::Refresh))
+                    .map_err(|e| e.to_string())
+            })
+        }
+        Dialog::NewFile { dir, name, first } => {
+            let dir = dir.clone();
+            text_dialog(
+                ctx,
+                "Novo documento de texto",
+                "Nome do arquivo:",
+                name,
+                first,
+                true,
+                |name| {
+                    ops::create_file(&dir, name)
+                        .map(|_| actions.push(Action::Refresh))
+                        .map_err(|e| e.to_string())
+                },
+            )
+        }
+        Dialog::ConfirmDelete { paths, permanent } => confirm_delete(ctx, app, paths, *permanent),
+        Dialog::Group {
+            index,
+            name,
+            color,
+            first,
+        } => group_dialog(ctx, app, *index, name, color, first, &mut actions),
+        Dialog::Properties { paths, entry, info } => properties(ctx, paths, entry.as_ref(), info),
+        Dialog::Error { title, message } => {
+            let m = Modal::new(Id::unique("dlg_error")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading(title.as_str());
+                ui.add_space(6.0);
+                ui.label(message.as_str());
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.button("OK").clicked())
+                    .inner
+            });
+            if m.inner || m.should_close() || ctx.input(|i| i.key_pressed(Key::Enter)) {
+                Outcome::Close
+            } else {
+                Outcome::Keep
+            }
+        }
+        Dialog::Shortcuts => shortcuts_dialog(ctx),
+    };
+    match outcome {
+        Outcome::Keep => app.dialog = dialog,
+        Outcome::Close => app.dialog = Dialog::None,
+    }
+    app.pending.extend(actions);
+}
+
+/// Seleciona o nome sem a extensão (como o Explorador faz ao renomear).
+fn select_stem(ctx: &Context, id: Id, text: &str, keep_ext: bool) {
+    if let Some(mut state) = TextEdit::load_state(ctx, id) {
+        let end = if keep_ext {
+            match text.rfind('.') {
+                Some(i) if i > 0 => text[..i].chars().count(),
+                _ => text.chars().count(),
+            }
+        } else {
+            text.chars().count()
+        };
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(end),
+        )));
+        state.store(ctx, id);
+    }
+}
+
+fn text_dialog(
+    ctx: &Context,
+    title: &str,
+    label: &str,
+    name: &mut String,
+    first: &mut bool,
+    keep_ext: bool,
+    mut on_ok: impl FnMut(&str) -> Result<(), String>,
+) -> Outcome {
+    let id = Id::unique(("dlg_text", title));
+    let mut result = Outcome::Keep;
+    let m = Modal::new(Id::unique(("modal", title))).show(ctx, |ui| {
+        ui.set_width(420.0);
+        ui.heading(title);
+        ui.add_space(6.0);
+        ui.label(label);
+        let resp = ui.add(TextEdit::singleline(name).id(id).desired_width(f32::INFINITY));
+        if *first {
+            resp.request_focus();
+            select_stem(ctx, id, name, keep_ext);
+            *first = false;
+        }
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        let err_id = id.with("err");
+        let mut err: Option<String> = ui.memory(|m| m.data.get_temp(err_id));
+        if let Some(e) = &err {
+            ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+        }
+        ui.add_space(10.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let ok = ui.button("OK").clicked() || enter;
+            let cancel = ui.button("Cancelar").clicked();
+            if ok {
+                match on_ok(name) {
+                    Ok(()) => {
+                        result = Outcome::Close;
+                        err = None;
+                    }
+                    Err(e) => {
+                        err = Some(e);
+                        resp.request_focus();
+                    }
+                }
+            }
+            if cancel {
+                result = Outcome::Close;
+                err = None;
+            }
+        });
+        ui.memory_mut(|m| match err {
+            Some(e) => {
+                m.data.insert_temp(err_id, e);
+            }
+            None => {
+                m.data.remove::<String>(err_id);
+            }
+        });
+    });
+    if m.should_close() {
+        ctx.memory_mut(|m| m.data.remove::<String>(id.with("err")));
+        return Outcome::Close;
+    }
+    result
+}
+
+fn confirm_delete(ctx: &Context, app: &mut TabexApp, paths: &[PathBuf], permanent: bool) -> Outcome {
+    let n = paths.len();
+    let what = if n == 1 {
+        format!(
+            "\"{}\"",
+            paths[0]
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        )
+    } else {
+        format!("estes {} itens", n)
+    };
+    let msg = if permanent {
+        format!("Tem certeza de que deseja excluir permanentemente {what}?")
+    } else {
+        format!("Tem certeza de que deseja mover {what} para a Lixeira?")
+    };
+    let mut result = Outcome::Keep;
+    let m = Modal::new(Id::unique("dlg_delete")).show(ctx, |ui| {
+        ui.set_width(440.0);
+        ui.heading(if permanent {
+            "Excluir permanentemente"
+        } else {
+            "Excluir"
+        });
+        ui.add_space(6.0);
+        ui.label(msg);
+        if n > 1 {
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                for p in paths.iter().take(200) {
+                    ui.weak(
+                        p.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    );
+                }
+            });
+        }
+        ui.add_space(12.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let yes = ui.button("Sim").clicked() || ui.input(|i| i.key_pressed(Key::Enter));
+            let no = ui.button("Não").clicked();
+            if yes {
+                app.ops.push(ops::start_delete(paths.to_vec(), permanent));
+                result = Outcome::Close;
+            } else if no {
+                result = Outcome::Close;
+            }
+        });
+    });
+    if m.should_close() {
+        return Outcome::Close;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn group_dialog(
+    ctx: &Context,
+    app: &mut TabexApp,
+    index: Option<usize>,
+    name: &mut String,
+    color: &mut GroupColor,
+    first: &mut bool,
+    actions: &mut Vec<Action>,
+) -> Outcome {
+    let mut result = Outcome::Keep;
+    let id = Id::unique("dlg_group_name");
+    let m = Modal::new(Id::unique("dlg_group")).show(ctx, |ui| {
+        ui.set_width(400.0);
+        ui.heading(if index.is_some() {
+            "Editar grupo de abas"
+        } else {
+            "Novo grupo de abas"
+        });
+        ui.add_space(6.0);
+        ui.label("Nome do grupo:");
+        let resp = ui.add(TextEdit::singleline(name).id(id).desired_width(f32::INFINITY));
+        if *first {
+            resp.request_focus();
+            select_stem(ctx, id, name, false);
+            *first = false;
+        }
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        ui.add_space(8.0);
+        ui.label("Cor:");
+        ui.horizontal_wrapped(|ui| {
+            for c in GroupColor::ALL {
+                let (rect, r) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+                let center = rect.center();
+                ui.painter().circle_filled(center, 11.0, c.color());
+                if *color == c {
+                    ui.painter().circle_stroke(center, 14.0, Stroke::new(2.0, c.color()));
+                }
+                if r.hovered() {
+                    ui.painter()
+                        .circle_stroke(center, 13.0, Stroke::new(1.0, ui.visuals().text_color()));
+                }
+                let r = r.on_hover_text(c.label());
+                if r.clicked() {
+                    *color = c;
+                }
+            }
+        });
+        ui.add_space(6.0);
+        // Pré-visualização
+        let preview = Button::new(RichText::new(name.as_str()).color(color.text_color()).size(12.5))
+            .fill(color.color())
+            .corner_radius(CornerRadius::same(11))
+            .stroke(Stroke::NONE);
+        ui.add_enabled(false, preview);
+        ui.add_space(12.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let ok = ui.button(if index.is_some() { "Salvar" } else { "Criar" }).clicked() || enter;
+            if ui.button("Cancelar").clicked() {
+                result = Outcome::Close;
+            }
+            if ok {
+                let final_name = if name.trim().is_empty() {
+                    "Grupo".to_owned()
+                } else {
+                    name.trim().to_owned()
+                };
+                match index {
+                    Some(gi) => {
+                        if let Some(g) = app.session.groups.get_mut(gi) {
+                            g.name = final_name;
+                            g.color = *color;
+                        }
+                    }
+                    None => {
+                        let p = app.session.active_tab().path.clone();
+                        let gi = app.session.new_group(Some(final_name));
+                        app.session.groups[gi].color = *color;
+                        app.session.open_tab(gi, p);
+                    }
+                }
+                actions.push(Action::Toast("Grupo salvo".into()));
+                result = Outcome::Close;
+            }
+        });
+        let _ = ui
+            .painter()
+            .rect_stroke(egui::Rect::NOTHING, 0, Stroke::NONE, StrokeKind::Inside);
+    });
+    if m.should_close() {
+        return Outcome::Close;
+    }
+    result
+}
+
+fn properties(
+    ctx: &Context,
+    paths: &[PathBuf],
+    entry: Option<&FileEntry>,
+    info: &Arc<Mutex<PropertiesInfo>>,
+) -> Outcome {
+    let snapshot = info.lock().map(|i| i.clone()).unwrap_or_default();
+    if !snapshot.finished {
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+    let mut close = false;
+    let m = Modal::new(Id::unique("dlg_props")).show(ctx, |ui| {
+        ui.set_width(460.0);
+        match entry {
+            Some(e) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(e.kind.icon()).size(28.0));
+                    ui.heading(&e.name);
+                });
+                ui.separator();
+                Grid::new("props_grid")
+                    .num_columns(2)
+                    .spacing(vec2(16.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.weak("Tipo:");
+                        ui.label(&e.type_label);
+                        ui.end_row();
+                        ui.weak("Local:");
+                        ui.add(egui::Label::new(e.parent_display()).wrap());
+                        ui.end_row();
+                        ui.weak("Tamanho:");
+                        let bytes = if e.is_dir { snapshot.bytes } else { e.size };
+                        ui.label(format!(
+                            "{} ({} bytes){}",
+                            format_size_human(bytes),
+                            thousands(bytes),
+                            if e.is_dir && !snapshot.finished {
+                                " — calculando…"
+                            } else {
+                                ""
+                            }
+                        ));
+                        ui.end_row();
+                        if e.is_dir {
+                            ui.weak("Contém:");
+                            ui.label(format!(
+                                "{} {}, {} {}",
+                                thousands(snapshot.files as u64),
+                                plural(snapshot.files, "arquivo", "arquivos"),
+                                thousands(snapshot.folders as u64),
+                                plural(snapshot.folders, "pasta", "pastas")
+                            ));
+                            ui.end_row();
+                        }
+                        if let Ok(md) = std::fs::metadata(&e.path) {
+                            ui.weak("Criado em:");
+                            ui.label(format_date(md.created().ok()));
+                            ui.end_row();
+                            ui.weak("Modificado em:");
+                            ui.label(format_date(md.modified().ok()));
+                            ui.end_row();
+                            ui.weak("Acessado em:");
+                            ui.label(format_date(md.accessed().ok()));
+                            ui.end_row();
+                            ui.weak("Somente leitura:");
+                            ui.label(if md.permissions().readonly() { "Sim" } else { "Não" });
+                            ui.end_row();
+                        }
+                        ui.weak("Oculto:");
+                        ui.label(if e.is_hidden { "Sim" } else { "Não" });
+                        ui.end_row();
+                    });
+            }
+            None => {
+                ui.heading(format!("{} itens selecionados", paths.len()));
+                ui.separator();
+                Grid::new("props_grid_multi")
+                    .num_columns(2)
+                    .spacing(vec2(16.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.weak("Tamanho total:");
+                        ui.label(format!(
+                            "{} ({} bytes){}",
+                            format_size_human(snapshot.bytes),
+                            thousands(snapshot.bytes),
+                            if snapshot.finished { "" } else { " — calculando…" }
+                        ));
+                        ui.end_row();
+                        ui.weak("Contém:");
+                        ui.label(format!(
+                            "{} {}, {} {}",
+                            thousands(snapshot.files as u64),
+                            plural(snapshot.files, "arquivo", "arquivos"),
+                            thousands(snapshot.folders as u64),
+                            plural(snapshot.folders, "pasta", "pastas")
+                        ));
+                        ui.end_row();
+                        ui.weak("Local:");
+                        ui.add(
+                            egui::Label::new(
+                                paths[0]
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                            )
+                            .wrap(),
+                        );
+                        ui.end_row();
+                    });
+            }
+        }
+        ui.add_space(12.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Fechar").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                close = true;
+            }
+        });
+    });
+    if close || m.should_close() {
+        Outcome::Close
+    } else {
+        Outcome::Keep
+    }
+}
+
+fn shortcuts_dialog(ctx: &Context) -> Outcome {
+    let mut close = false;
+    let m = Modal::new(Id::unique("dlg_shortcuts")).show(ctx, |ui| {
+        ui.set_width(760.0);
+        ui.heading("Atalhos de teclado");
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+            ui.columns(3, |cols| {
+                for (col, (section, items)) in cols.iter_mut().zip(HELP.iter()) {
+                    col.strong(*section);
+                    col.add_space(4.0);
+                    Grid::new(("sc", section))
+                        .num_columns(2)
+                        .spacing(vec2(10.0, 3.0))
+                        .striped(true)
+                        .show(col, |ui| {
+                            for (keys, desc) in items.iter() {
+                                ui.label(RichText::new(*keys).monospace().size(12.0));
+                                ui.label(RichText::new(*desc).size(12.5));
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+        });
+        ui.add_space(10.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Fechar").clicked() {
+                close = true;
+            }
+        });
+    });
+    if close || m.should_close() {
+        Outcome::Close
+    } else {
+        Outcome::Keep
+    }
+}
+
+#[allow(dead_code)]
+fn _keep(_: &mut Ui) {}
