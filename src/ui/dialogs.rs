@@ -4,8 +4,7 @@ use crate::fs::ops::{self, PropertiesInfo};
 use crate::model::color::GroupColor;
 use crate::shortcuts::HELP;
 use egui::{
-    vec2, Align, Button, Context, CornerRadius, Grid, Id, Key, Layout, Modal, RichText, Sense, Stroke, StrokeKind,
-    TextEdit, Ui,
+    vec2, Align, Button, Context, CornerRadius, Grid, Id, Key, Layout, Modal, RichText, Sense, Stroke, TextEdit, Ui,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -38,6 +37,13 @@ pub enum Dialog {
         color: GroupColor,
         first: bool,
     },
+    Window {
+        index: Option<usize>,
+        name: String,
+        color: GroupColor,
+        first: bool,
+    },
+    Update,
     Properties {
         paths: Vec<PathBuf>,
         entry: Option<FileEntry>,
@@ -131,7 +137,76 @@ pub fn show(ctx: &Context, app: &mut TabexApp) {
             name,
             color,
             first,
-        } => group_dialog(ctx, app, *index, name, color, first, &mut actions),
+        } => {
+            let is_edit = index.is_some();
+            let (outcome, picked) = name_color_dialog(
+                ctx,
+                "dlg_group",
+                if is_edit {
+                    "Editar grupo de abas"
+                } else {
+                    "Novo grupo de abas"
+                },
+                "Nome do grupo:",
+                if is_edit { "Salvar" } else { "Criar" },
+                name,
+                color,
+                first,
+            );
+            if let Some((final_name, c)) = picked {
+                match index {
+                    Some(gi) => {
+                        if let Some(g) = app.session.groups.get_mut(*gi) {
+                            g.name = final_name;
+                            g.color = c;
+                        }
+                    }
+                    None => {
+                        let p = app.session.active_tab().path.clone();
+                        let gi = app.session.new_group(Some(final_name));
+                        app.session.groups[gi].color = c;
+                        app.session.open_tab(gi, p);
+                    }
+                }
+                actions.push(Action::Toast("Grupo salvo".into()));
+            }
+            outcome
+        }
+        Dialog::Window {
+            index,
+            name,
+            color,
+            first,
+        } => {
+            let is_edit = index.is_some();
+            let (outcome, picked) = name_color_dialog(
+                ctx,
+                "dlg_window",
+                if is_edit { "Editar janela" } else { "Nova janela" },
+                "Nome da janela:",
+                if is_edit { "Salvar" } else { "Criar" },
+                name,
+                color,
+                first,
+            );
+            if let Some((final_name, c)) = picked {
+                match index {
+                    Some(wi) => {
+                        if let Some(w) = app.session.windows.get_mut(*wi) {
+                            w.name = final_name;
+                            w.color = c;
+                        }
+                    }
+                    None => {
+                        let p = app.session.active_tab().path.clone();
+                        app.session.new_window(Some(final_name), Some(c), p);
+                    }
+                }
+                actions.push(Action::Toast("Janela salva".into()));
+            }
+            outcome
+        }
+        Dialog::Update => update_dialog(ctx, app, &mut actions),
         Dialog::Properties { paths, entry, info } => properties(ctx, paths, entry.as_ref(), info),
         Dialog::Error { title, message } => {
             let m = Modal::new(Id::unique("dlg_error")).show(ctx, |ui| {
@@ -301,26 +376,24 @@ fn confirm_delete(ctx: &Context, app: &mut TabexApp, paths: &[PathBuf], permanen
 }
 
 #[allow(clippy::too_many_arguments)]
-fn group_dialog(
+fn name_color_dialog(
     ctx: &Context,
-    app: &mut TabexApp,
-    index: Option<usize>,
+    id_salt: &str,
+    title: &str,
+    label: &str,
+    ok_label: &str,
     name: &mut String,
     color: &mut GroupColor,
     first: &mut bool,
-    actions: &mut Vec<Action>,
-) -> Outcome {
+) -> (Outcome, Option<(String, GroupColor)>) {
     let mut result = Outcome::Keep;
-    let id = Id::unique("dlg_group_name");
-    let m = Modal::new(Id::unique("dlg_group")).show(ctx, |ui| {
+    let mut picked = None;
+    let id = Id::unique((id_salt, "name"));
+    let m = Modal::new(Id::unique(id_salt)).show(ctx, |ui| {
         ui.set_width(400.0);
-        ui.heading(if index.is_some() {
-            "Editar grupo de abas"
-        } else {
-            "Novo grupo de abas"
-        });
+        ui.heading(title);
         ui.add_space(6.0);
-        ui.label("Nome do grupo:");
+        ui.label(label);
         let resp = ui.add(TextEdit::singleline(name).id(id).desired_width(f32::INFINITY));
         if *first {
             resp.request_focus();
@@ -349,7 +422,6 @@ fn group_dialog(
             }
         });
         ui.add_space(6.0);
-        // Pré-visualização
         let preview = Button::new(RichText::new(name.as_str()).color(color.text_color()).size(12.5))
             .fill(color.color())
             .corner_radius(CornerRadius::same(11))
@@ -357,42 +429,136 @@ fn group_dialog(
         ui.add_enabled(false, preview);
         ui.add_space(12.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let ok = ui.button(if index.is_some() { "Salvar" } else { "Criar" }).clicked() || enter;
+            let ok = ui.button(ok_label).clicked() || enter;
             if ui.button("Cancelar").clicked() {
                 result = Outcome::Close;
             }
             if ok {
                 let final_name = if name.trim().is_empty() {
-                    "Grupo".to_owned()
+                    "Sem nome".to_owned()
                 } else {
                     name.trim().to_owned()
                 };
-                match index {
-                    Some(gi) => {
-                        if let Some(g) = app.session.groups.get_mut(gi) {
-                            g.name = final_name;
-                            g.color = *color;
-                        }
-                    }
-                    None => {
-                        let p = app.session.active_tab().path.clone();
-                        let gi = app.session.new_group(Some(final_name));
-                        app.session.groups[gi].color = *color;
-                        app.session.open_tab(gi, p);
-                    }
-                }
-                actions.push(Action::Toast("Grupo salvo".into()));
+                picked = Some((final_name, *color));
                 result = Outcome::Close;
             }
         });
-        let _ = ui
-            .painter()
-            .rect_stroke(egui::Rect::NOTHING, 0, Stroke::NONE, StrokeKind::Inside);
     });
     if m.should_close() {
-        return Outcome::Close;
+        return (Outcome::Close, None);
     }
-    result
+    (result, picked)
+}
+
+fn update_dialog(ctx: &Context, app: &mut TabexApp, actions: &mut Vec<Action>) -> Outcome {
+    use crate::update::{UpdateState, Updater, CURRENT};
+    let state = app.updater.state();
+    if app.updater.is_busy() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+    let mut close = false;
+    let m = Modal::new(Id::unique("dlg_update")).show(ctx, |ui| {
+        ui.set_width(480.0);
+        ui.heading("Atualizações do Tabex");
+        ui.add_space(4.0);
+        ui.label(format!("Versão instalada: {CURRENT}"));
+        ui.weak(format!("Fonte: github.com/{}", crate::update::REPO));
+        ui.add_space(8.0);
+        match &state {
+            UpdateState::Idle => {
+                ui.label("Clique em \"Verificar agora\" para procurar uma versão nova.");
+            }
+            UpdateState::Checking => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Verificando…");
+                });
+            }
+            UpdateState::UpToDate => {
+                ui.label(RichText::new("✔ Você já está na versão mais recente.").color(ui.visuals().hyperlink_color));
+            }
+            UpdateState::Available(info) => {
+                ui.label(RichText::new(format!("Nova versão disponível: {}", info.tag)).strong());
+                if info.asset_name.is_none() {
+                    ui.label(
+                        RichText::new(
+                            "A release não tem um pacote para esta plataforma; abra a página para baixar manualmente.",
+                        )
+                        .color(ui.visuals().warn_fg_color),
+                    );
+                }
+                if !info.notes.trim().is_empty() {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        ui.label(RichText::new(info.notes.trim()).size(12.5));
+                    });
+                }
+            }
+            UpdateState::Downloading(info) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Baixando e instalando {}…", info.tag));
+                });
+            }
+            UpdateState::Installed(info) => {
+                ui.label(
+                    RichText::new(format!("✔ Versão {} instalada.", info.tag)).color(ui.visuals().hyperlink_color),
+                );
+                ui.label("Reinicie o Tabex para usar a nova versão. Suas janelas, grupos e abas são mantidos.");
+            }
+            UpdateState::Error(e) => {
+                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+                ui.add_space(4.0);
+                ui.weak(format!(
+                    "Repositório privado? Salve um token do GitHub (permissão de leitura de releases) em:\n{}",
+                    Updater::token_path().display()
+                ));
+            }
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let mut auto = app.session.auto_update;
+            if ui
+                .checkbox(&mut auto, "Verificar automaticamente ao iniciar (1x por dia)")
+                .changed()
+            {
+                actions.push(Action::ToggleAutoUpdate);
+            }
+        });
+        ui.add_space(8.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Fechar").clicked() {
+                close = true;
+            }
+            match &state {
+                UpdateState::Available(info) => {
+                    if info.asset_url.is_some() && ui.button(RichText::new("⬇ Baixar e instalar").strong()).clicked()
+                    {
+                        actions.push(Action::InstallUpdate);
+                    }
+                    if !info.html_url.is_empty() && ui.button("Abrir página da release").clicked() {
+                        let _ = open::that_detached(&info.html_url);
+                    }
+                }
+                UpdateState::Installed(_) => {
+                    if ui.button(RichText::new("🔄 Reiniciar agora").strong()).clicked() {
+                        actions.push(Action::RestartApp);
+                    }
+                }
+                UpdateState::Checking | UpdateState::Downloading(_) => {}
+                _ => {
+                    if ui.button("Verificar agora").clicked() {
+                        actions.push(Action::CheckUpdates { manual: true });
+                    }
+                }
+            }
+        });
+    });
+    if close || m.should_close() {
+        Outcome::Close
+    } else {
+        Outcome::Keep
+    }
 }
 
 fn properties(

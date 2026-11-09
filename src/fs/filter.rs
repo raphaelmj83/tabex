@@ -315,7 +315,12 @@ impl Query {
 
     pub fn matches(&self, e: &FileEntry, now: &DateTime<Local>) -> bool {
         for t in &self.terms {
-            if !e.name_lower.contains(t.as_str()) {
+            let ok = if t.contains(['*', '?']) {
+                wildcard_match(t, &e.name_lower)
+            } else {
+                e.name_lower.contains(t.as_str())
+            };
+            if !ok {
                 return false;
             }
         }
@@ -345,6 +350,35 @@ impl Query {
         }
         true
     }
+}
+
+/// Curinga no estilo do Explorador: `*` = qualquer sequência, `?` = um caractere.
+/// A comparação é feita sobre o nome inteiro (`*.pdf`, `relat*`, `foto_??.jpg`).
+pub fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = Some(pi);
+            star_t = ti;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn parse_size(s: &str) -> Option<u64> {
@@ -423,6 +457,23 @@ mod tests {
         assert!(Query::parse("data:hoje").matches(&pdf, &now));
         assert!(!Query::parse("data:hoje").matches(&py, &now));
         assert!(Query::parse("tipo:codigo").matches(&py, &now));
+    }
+
+    #[test]
+    fn wildcards_like_explorer() {
+        assert!(wildcard_match("*.pdf", "relatorio.pdf"));
+        assert!(!wildcard_match("*.pdf", "relatorio.pdf.bak"));
+        assert!(wildcard_match("*.exe", "setup.exe"));
+        assert!(wildcard_match("relat*", "relatorio final.pdf"));
+        assert!(wildcard_match("foto_??.jpg", "foto_01.jpg"));
+        assert!(!wildcard_match("foto_??.jpg", "foto_001.jpg"));
+        assert!(wildcard_match("*", "qualquer"));
+        let now = Local::now();
+        let exe = entry("Setup.EXE", false, 10, 0);
+        let pdf = entry("a.pdf", false, 10, 0);
+        assert!(Query::parse("*.exe").matches(&exe, &now));
+        assert!(!Query::parse("*.exe").matches(&pdf, &now));
+        assert!(Query::parse("*.pdf").matches(&pdf, &now));
     }
 
     #[test]

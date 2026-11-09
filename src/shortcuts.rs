@@ -35,6 +35,11 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+G", "Novo grupo de abas"),
             ("Ctrl+Shift+G", "Renomear / cor do grupo atual"),
             ("Ctrl+Alt+→ / ←", "Próximo / grupo anterior"),
+            ("Ctrl+Alt+T / Ctrl+Alt+W", "Nova janela / fechar janela"),
+            ("Ctrl+Alt+G", "Renomear / cor da janela atual"),
+            ("Ctrl+Alt+PgDn / PgUp", "Próxima / janela anterior"),
+            ("Ctrl+Alt+1 … 9", "Ir para a janela N"),
+            ("Arrastar aba até uma janela", "Mover aba para a janela"),
             ("Clique do meio na aba", "Fechar aba"),
             ("Arrastar aba", "Mover para outro grupo ou posição"),
         ],
@@ -128,6 +133,39 @@ pub fn collect(ctx: &Context, editing_address: bool) -> Vec<Action> {
         }
         if i.consume_key(CMD, Key::G) {
             out.push(Action::NewGroup);
+        }
+        if i.consume_key(CMD_ALT, Key::T) {
+            out.push(Action::NewWindow);
+        }
+        if i.consume_key(CMD_ALT, Key::W) {
+            out.push(Action::CloseActiveWindow);
+        }
+        if i.consume_key(CMD_ALT, Key::G) {
+            out.push(Action::EditActiveWindow);
+        }
+        if i.consume_key(CMD_ALT, Key::PageDown) {
+            out.push(Action::CycleWindow(1));
+        }
+        if i.consume_key(CMD_ALT, Key::PageUp) {
+            out.push(Action::CycleWindow(-1));
+        }
+        for (n, k) in [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ]
+        .iter()
+        .enumerate()
+        {
+            if i.consume_key(CMD_ALT, *k) {
+                out.push(Action::SwitchWindow(n));
+            }
         }
         if i.consume_key(CMD_ALT, Key::ArrowRight) {
             out.push(Action::CycleGroup(1));

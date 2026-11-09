@@ -5,6 +5,7 @@ use egui::{Align, Layout, ProgressBar, RichText, Ui};
 pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     let tab = app.session.active_tab();
     let mut clear_filters = false;
+    let mut show_update = false;
     ui.horizontal(|ui| {
         let n = tab.visible_count();
         ui.label(format!("{} {}", thousands(n as u64), plural(n, "item", "itens")));
@@ -67,6 +68,22 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let crate::update::UpdateState::Available(info) = app.updater.state() {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("⬆ Atualizar para {}", info.tag))
+                                .color(ui.visuals().hyperlink_color)
+                                .small(),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    show_update = true;
+                }
+                ui.separator();
+            }
             if let Some((msg, _)) = &app.toast {
                 ui.label(RichText::new(msg).color(ui.visuals().hyperlink_color));
                 ui.separator();
@@ -90,5 +107,8 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     });
     if clear_filters {
         app.pending.push(crate::app::Action::ClearFilters);
+    }
+    if show_update {
+        app.pending.push(crate::app::Action::ShowUpdateDialog);
     }
 }

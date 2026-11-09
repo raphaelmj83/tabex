@@ -103,3 +103,36 @@ pub fn file(painter: &Painter, rect: Rect, accent: Color32, dark: bool) {
         accent,
     );
 }
+
+/// Pasta na cor do serviço de nuvem, com uma pequena nuvem branca sobreposta.
+pub fn cloud_folder(painter: &Painter, rect: Rect, color: Color32) {
+    let r = rect.shrink2(vec2(rect.width() * 0.04, rect.height() * 0.12));
+    let back = color.linear_multiply(0.85);
+    let tab = Rect::from_min_size(r.min, vec2(r.width() * 0.45, r.height() * 0.28));
+    painter.rect_filled(
+        tab,
+        CornerRadius {
+            nw: 2,
+            ne: 2,
+            sw: 0,
+            se: 0,
+        },
+        back,
+    );
+    let body = Rect::from_min_max(pos2(r.min.x, r.min.y + r.height() * 0.18), r.max);
+    painter.rect_filled(body, CornerRadius::same(2), back);
+    let front = Rect::from_min_max(pos2(r.min.x, r.min.y + r.height() * 0.40), r.max);
+    painter.rect_filled(front, CornerRadius::same(2), color);
+    // nuvem: três círculos + base
+    let c = front.center() + vec2(0.0, r.height() * 0.05);
+    let w = Color32::from_rgba_unmultiplied(255, 255, 255, 230);
+    let s = r.width() * 0.11;
+    painter.circle_filled(c + vec2(-s * 1.1, s * 0.3), s * 0.9, w);
+    painter.circle_filled(c + vec2(0.0, -s * 0.3), s * 1.2, w);
+    painter.circle_filled(c + vec2(s * 1.2, s * 0.3), s * 0.9, w);
+    painter.rect_filled(
+        Rect::from_center_size(c + vec2(0.0, s * 0.6), vec2(s * 4.2, s * 1.2)),
+        CornerRadius::same(2),
+        w,
+    );
+}

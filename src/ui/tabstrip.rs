@@ -29,7 +29,7 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for gi in 0..ngroups {
                     let group = &app.session.groups[gi];
-                    draw_group_chip(ui, gi, group, gi == ag, ngroups, &mut actions);
+                    draw_group_chip(ui, gi, group, gi == ag, ngroups, &app.session, &mut actions);
                     if group.collapsed {
                         ui.add_space(4.0);
                         continue;
@@ -104,6 +104,7 @@ fn draw_group_chip(
     group: &TabGroup,
     is_active: bool,
     ngroups: usize,
+    session: &Session,
     actions: &mut Vec<Action>,
 ) {
     let color = group.color.color();
@@ -198,6 +199,19 @@ fn draw_group_chip(
             .clicked()
         {
             actions.push(Action::MoveGroup(gi, 1));
+        }
+        if session.windows.len() > 1 {
+            ui.menu_button("🗔 Mover grupo para a janela", |ui| {
+                for (wi, w) in session.windows.iter().enumerate() {
+                    if wi == session.active_window {
+                        continue;
+                    }
+                    let label = RichText::new(format!("●  {}", w.name)).color(w.color.color());
+                    if ui.button(label).clicked() {
+                        actions.push(Action::MoveGroupToWindow { g: gi, w: wi });
+                    }
+                }
+            });
         }
         ui.separator();
         if ui.button("✖ Fechar grupo").clicked() {
@@ -370,6 +384,22 @@ fn draw_tab(
                 });
             }
         });
+        if session.windows.len() > 1 {
+            ui.menu_button("🗔 Mover para a janela", |ui| {
+                for (wi, w) in session.windows.iter().enumerate() {
+                    if wi == session.active_window {
+                        continue;
+                    }
+                    let label = RichText::new(format!("●  {}", w.name)).color(w.color.color());
+                    if ui.button(label).clicked() {
+                        actions.push(Action::MoveTabToWindow { g: gi, t: ti, w: wi });
+                    }
+                }
+            });
+        }
+        if ui.button("🗔 Mover para uma nova janela").clicked() {
+            actions.push(Action::MoveTabToNewWindow(gi, ti));
+        }
         if ui.add_enabled(ti > 0, Button::new("◀ Mover para a esquerda")).clicked() {
             actions.push(Action::ActivateTab(gi, ti));
             actions.push(Action::MoveTab(-1));

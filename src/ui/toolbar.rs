@@ -24,6 +24,9 @@ fn command_bar(ui: &mut Ui, app: &mut TabexApp, actions: &mut Vec<Action>) {
     let sidebar = app.session.sidebar_visible;
     let hidden = app.session.show_hidden;
     let dark = app.session.dark_theme;
+    let native_menu = app.session.use_native_menu;
+    let native_supported = crate::platform::native_menu_supported();
+    let update_available = matches!(app.updater.state(), crate::update::UpdateState::Available(_));
 
     ui.horizontal(|ui| {
         ui.menu_button("⊕ Novo", |ui| {
@@ -101,6 +104,14 @@ fn command_bar(ui: &mut Ui, app: &mut TabexApp, actions: &mut Vec<Action>) {
             if ui.button(check(dark, "Tema escuro")).clicked() {
                 actions.push(Action::ToggleTheme);
             }
+            if native_supported
+                && ui
+                    .button(check(native_menu, "Menu de contexto do Windows"))
+                    .on_hover_text("Botão direito abre o mesmo menu do Explorador (com os itens do Tabex no topo)")
+                    .clicked()
+            {
+                actions.push(Action::ToggleNativeMenu);
+            }
             ui.separator();
             ui.menu_button("Agrupar por", |ui| {
                 for g in [GroupBy::None, GroupBy::Date, GroupBy::Kind] {
@@ -146,6 +157,14 @@ fn command_bar(ui: &mut Ui, app: &mut TabexApp, actions: &mut Vec<Action>) {
                     actions.push(Action::InvertSelection);
                 }
                 ui.separator();
+                let upd_label = if update_available {
+                    "⬆ Atualizações (nova versão!)"
+                } else {
+                    "⬆ Atualizações…"
+                };
+                if ui.button(upd_label).clicked() {
+                    actions.push(Action::ShowUpdateDialog);
+                }
                 if ui.button("Abrir pasta de configuração do Tabex").clicked() {
                     if let Some(dir) = crate::model::session::Session::config_path().parent() {
                         let _ = std::fs::create_dir_all(dir);
@@ -153,9 +172,17 @@ fn command_bar(ui: &mut Ui, app: &mut TabexApp, actions: &mut Vec<Action>) {
                     }
                 }
                 ui.label(
-                    RichText::new(format!("Tabex v{}", env!("CARGO_PKG_VERSION")))
-                        .weak()
-                        .small(),
+                    RichText::new(format!(
+                        "Tabex v{}{}",
+                        env!("CARGO_PKG_VERSION"),
+                        if crate::model::session::Session::is_portable() {
+                            " · portátil"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .weak()
+                    .small(),
                 );
             });
         });

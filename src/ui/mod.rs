@@ -6,6 +6,7 @@ pub mod statusbar;
 pub mod tabstrip;
 pub mod theme;
 pub mod toolbar;
+pub mod windowbar;
 
 /// Pequeno botão de ícone sem moldura, com dica.
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool) -> egui::Response {

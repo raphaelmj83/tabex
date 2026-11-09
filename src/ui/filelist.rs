@@ -26,6 +26,7 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
         .unwrap_or_default();
     let has_clip = app.clipboard.is_some();
     let pinned: Vec<PathBuf> = app.session.pinned.clone();
+    let native = app.native_menu_enabled();
     let tab: &mut Tab = &mut app.session.groups[g].tabs[t];
 
     let bg_rect = ui.max_rect();
@@ -35,7 +36,16 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
         ui.centered_and_justified(|ui| {
             ui.label(RichText::new(err).size(15.0).weak());
         });
-        background_menu(&bg, tab, has_clip, &pinned, &mut actions);
+        if native {
+            if bg.secondary_clicked() {
+                actions.push(Action::NativeMenu {
+                    paths: Vec::new(),
+                    folder: tab.path.clone(),
+                });
+            }
+        } else {
+            background_menu(&bg, tab, has_clip, &pinned, &mut actions);
+        }
         app.pending.extend(actions);
         return;
     }
@@ -214,7 +224,9 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                             if resp.middle_clicked() {
                                 events.push(RowEvent::Middle(*i));
                             }
-                            resp.context_menu(|ui| item_menu(ui, e, tab_ref, has_clip, &pinned, &mut actions));
+                            if !native {
+                                resp.context_menu(|ui| item_menu(ui, e, tab_ref, has_clip, &pinned, &mut actions));
+                            }
                         }
                     }
                 });
@@ -278,6 +290,15 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                         tab.select_only(i);
                     }
                 }
+                if native {
+                    let paths = tab.selected_paths();
+                    if !paths.is_empty() {
+                        actions.push(Action::NativeMenu {
+                            paths,
+                            folder: tab.path.clone(),
+                        });
+                    }
+                }
             }
             RowEvent::Middle(i) => {
                 if let Some(e) = tab.entry(i).cloned() {
@@ -291,7 +312,16 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     if bg.clicked() && !clicked_row {
         tab.clear_selection();
     }
-    background_menu(&bg, tab, has_clip, &pinned, &mut actions);
+    if native {
+        if bg.secondary_clicked() && !clicked_row {
+            actions.push(Action::NativeMenu {
+                paths: Vec::new(),
+                folder: tab.path.clone(),
+            });
+        }
+    } else {
+        background_menu(&bg, tab, has_clip, &pinned, &mut actions);
+    }
 
     app.pending.extend(actions);
 }

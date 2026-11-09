@@ -1,8 +1,10 @@
-# Tabex — Explorador de Arquivos com Grupos de Abas
+<img src="docs/icon.png" width="72" align="right" alt="Ícone do Tabex">
+
+# Tabex — Explorador de Arquivos com Janelas e Grupos de Abas
 
 Gerenciador de arquivos escrito em **Rust** ([egui](https://github.com/emilk/egui)/eframe), inspirado no
-Explorador de Arquivos do Windows 11, com um diferencial: **grupos de abas coloridos** para organizar
-o trabalho (como os grupos de abas do Chrome).
+Explorador de Arquivos do Windows 11, com três níveis de organização: **janelas → grupos de abas → abas**,
+todos com nome e cor, para organizar tudo o que você tem aberto.
 
 ![Tabex – tema claro](docs/screenshot-light.png)
 
@@ -12,14 +14,46 @@ o trabalho (como os grupos de abas do Chrome).
 ![Tabex – tema escuro](docs/screenshot-dark.png)
 </details>
 
+## Instalação no Windows (C:\tabex)
+
+1. Baixe [`instalar.bat`](installer/instalar.bat) (botão "Raw" → salvar) e execute com dois cliques.
+2. Ele baixa a release mais recente do GitHub, instala em **`C:\tabex`**, cria atalhos no Menu Iniciar e na
+   Área de Trabalho e adiciona a pasta ao PATH. Não precisa de administrador.
+3. Para atualizar depois: rode `C:\tabex\atualizar.bat` **ou** use "⋯ › Atualizações" dentro do Tabex, que
+   baixa e instala a nova versão sozinho (o próprio executável se substitui e pede para reiniciar).
+
+O Tabex também verifica novas versões sozinho ao iniciar, uma vez por dia; quando há uma, aparece um aviso
+"⬆ Atualizar para vX" na barra de status.
+
+> **Repositório privado?** Salve um token do GitHub com permissão de leitura de releases em
+> `C:\tabex\github_token.txt` (ou na variável de ambiente `TABEX_GITHUB_TOKEN`). O instalador e o
+> atualizador interno usam esse token. Se houver um `tabex-windows-x64-*.zip` ao lado do `instalar.bat`,
+> ele é usado sem acessar a internet.
+
+**Configurações por computador.** Instalado em `C:\tabex` (ou em qualquer pasta gravável fora de
+Program Files), o Tabex roda em **modo portátil**: janelas, grupos, abas, pastas fixadas e preferências
+ficam em `C:\tabex\session.json`, separadas em cada máquina. Fora desse caso ele usa a pasta do usuário
+(tabela no fim deste arquivo).
+
 ## Recursos
 
-**Abas e grupos**
-- Abas de navegação independentes (histórico, ordenação e agrupamento por aba).
+**Janelas, grupos e abas**
+- **Janelas** (barra superior): espaços de trabalho com nome e cor, cada um com seus próprios grupos de abas.
+  Troque com um clique, Ctrl+Alt+PgDn/PgUp ou Ctrl+Alt+1…9. Arraste uma aba até uma janela para movê-la;
+  mova grupos inteiros pelo menu de contexto.
 - Grupos de abas com **nome e cor** (9 cores); clique no rótulo do grupo para recolher/expandir.
+- Abas de navegação independentes (histórico, ordenação e agrupamento por aba).
 - Arraste abas entre grupos ou para reordenar; arraste até "＋ Grupo" para criar um grupo novo.
-- Menu de contexto na aba: duplicar, mover para grupo, fechar outras, fechar à direita.
-- Reabrir aba fechada (Ctrl+Shift+T). A sessão (grupos, abas, fixados, tema) é salva automaticamente.
+- Menu de contexto na aba: duplicar, mover para grupo/janela, fechar outras, fechar à direita.
+- Reabrir aba fechada (Ctrl+Shift+T). A sessão é salva automaticamente.
+
+**Nuvem e menu nativo**
+- Painel lateral com a seção **Nuvem**: detecta automaticamente OneDrive (pessoal e comercial), Dropbox
+  (pessoal e business), Nextcloud, ownCloud, Google Drive e iCloud Drive pelas configurações dos clientes
+  de sincronização.
+- No Windows, o botão direito abre o **mesmo menu de contexto do Explorador** (Abrir com, Enviar para,
+  Compartilhar, 7-Zip, Git etc.), com os itens do Tabex no topo (abrir em nova aba/grupo/janela, fixar).
+  Pode ser desligado em "Visualizar › Menu de contexto do Windows" para usar o menu interno.
 
 **Navegação igual ao Explorer**
 - Barra de endereços em *breadcrumb* com menu "›" de subpastas; clique no espaço vazio ou Ctrl+L para digitar o caminho (`~`, `%USERPROFILE%` e `$HOME` são expandidos).
@@ -31,6 +65,7 @@ o trabalho (como os grupos de abas do Chrome).
 
 **Pesquisa e filtros**
 - Caixa de pesquisa filtra a pasta enquanto você digita; **Enter** pesquisa recursivamente nas subpastas em segundo plano (coluna extra "Pasta" nos resultados).
+- Curingas como no Explorer: `*.pdf`, `*.exe`, `relat*`, `foto_??.jpg`.
 - Prefixos: `ext:pdf,docx` · `tipo:pasta` / `tipo:arquivo` / `tipo:imagem` / `tipo:codigo` … · `tamanho:>1mb` / `tamanho:<500kb` · `data:hoje` / `data:semana` / `data:mes`.
 - Menu **Filtrar**: por tipo (pastas, documentos, imagens, vídeos…), data de modificação e faixas de tamanho (Vazio, Minúsculo, Pequeno, Médio, Grande…), iguais aos do Explorer.
 
@@ -51,6 +86,9 @@ o trabalho (como os grupos de abas do Chrome).
 | Ctrl+Shift+PgUp / PgDn | Mover aba |
 | Ctrl+G / Ctrl+Shift+G | Novo grupo / editar grupo atual |
 | Ctrl+Alt+← / → | Grupo anterior / próximo |
+| Ctrl+Alt+T / Ctrl+Alt+W | Nova janela / fechar janela |
+| Ctrl+Alt+PgDn / PgUp, Ctrl+Alt+1…9 | Alternar janelas |
+| Ctrl+Alt+G | Renomear / cor da janela atual |
 | Alt+← / Alt+→ / Alt+↑ / Backspace | Voltar / avançar / subir / voltar |
 | F5, Ctrl+R | Atualizar |
 | Ctrl+L, Alt+D, F4 | Barra de endereços |
@@ -89,9 +127,10 @@ uma tag `v*` publica os zips em uma Release do GitHub.
 
 ## Onde a sessão é salva
 
-| Sistema | Arquivo |
+| Situação | Arquivo |
 |---|---|
-| Windows | `%APPDATA%\tabex\session.json` |
+| Windows, instalado em `C:\tabex` (portátil) | `C:\tabex\session.json` |
+| Windows, outros casos | `%APPDATA%\tabex\session.json` |
 | Linux | `~/.config/tabex/session.json` |
 | macOS | `~/Library/Application Support/tabex/session.json` |
 
@@ -102,13 +141,18 @@ src/
   main.rs            ponto de entrada (eframe)
   app.rs             estado do aplicativo, fila de ações e loop de UI
   shortcuts.rs       tabela de atalhos de teclado
-  model/             sessão persistida: grupos, abas, cores
-  fs/                listagem, tipos, filtros/consulta, pesquisa recursiva, operações
-  ui/                barra de abas, barra de ferramentas, painel lateral, lista, status, diálogos, tema, ícones
+  update.rs          verificação/instalação de atualizações (releases do GitHub)
+  model/             sessão persistida: janelas, grupos, abas, cores
+  fs/                listagem, tipos, filtros/consulta, pesquisa recursiva, operações, nuvem
+  platform/          menu de contexto do shell do Windows (IContextMenu)
+  ui/                janelas, abas, barra de ferramentas, painel lateral, lista, status, diálogos, tema, ícones
+installer/           instalar.bat / atualizar.bat (C:\tabex)
+assets/              ícone (pasta azul) e gerador
 ```
 
 ## Roteiro
 
+- Janelas como janelas reais do sistema (viewports), além dos espaços de trabalho
 - Visualizações em ícones grandes/miniaturas
 - Painel de visualização (preview) de imagens e texto
 - Desfazer (Ctrl+Z) para mover/renomear

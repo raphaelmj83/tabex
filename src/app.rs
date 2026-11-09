@@ -1,11 +1,15 @@
+use crate::fs::cloud::{self, CloudFolder};
 use crate::fs::entry::{list_drives, FileEntry};
 use crate::fs::ops::{self, Clipboard, OpJob};
 use crate::model::color::GroupColor;
 use crate::model::session::Session;
 use crate::model::tab::{GroupBy, SortKey, Tab};
+use crate::platform::{self, MenuExtra};
 use crate::shortcuts;
 use crate::ui;
 use crate::ui::dialogs::Dialog;
+use crate::update::{UpdateState, Updater};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -16,6 +20,7 @@ pub enum Action {
     Navigate(PathBuf),
     OpenInNewTab(PathBuf),
     OpenInNewGroup(PathBuf),
+    OpenInNewWindow(PathBuf),
     Back,
     Forward,
     Up,
@@ -49,6 +54,40 @@ pub enum Action {
     MoveGroup(usize, isize),
     CloseGroup(usize),
     ActivateGroup(usize),
+
+    NewWindow,
+    EditWindow(usize),
+    EditActiveWindow,
+    SetWindowColor(usize, GroupColor),
+    SwitchWindow(usize),
+    CycleWindow(i32),
+    CloseWindow(usize),
+    CloseActiveWindow,
+    MoveWindow(usize, isize),
+    MoveGroupToWindow {
+        g: usize,
+        w: usize,
+    },
+    MoveTabToWindow {
+        g: usize,
+        t: usize,
+        w: usize,
+    },
+    MoveTabToNewWindow(usize, usize),
+
+    /// Menu de contexto nativo do sistema (Windows) para `paths`, ou da pasta se vazio.
+    NativeMenu {
+        paths: Vec<PathBuf>,
+        folder: PathBuf,
+    },
+    ToggleNativeMenu,
+    CheckUpdates {
+        manual: bool,
+    },
+    ShowUpdateDialog,
+    InstallUpdate,
+    RestartApp,
+    ToggleAutoUpdate,
 
     Open(Vec<PathBuf>),
     OpenSelected,
@@ -104,8 +143,13 @@ pub struct TabexApp {
     pub closed_tabs: Vec<Tab>,
     pub toast: Option<(String, Instant)>,
     pub drives: Vec<(String, PathBuf)>,
+    pub clouds: Vec<CloudFolder>,
+    pub updater: Updater,
+    pub hwnd: Option<isize>,
     pub pending_copy_text: Option<String>,
     drives_at: Instant,
+    clouds_at: Instant,
+    restart_requested: bool,
     dirty: bool,
     last_save: Instant,
     theme_applied: Option<bool>,
@@ -129,8 +173,13 @@ impl TabexApp {
             closed_tabs: Vec::new(),
             toast: None,
             drives: list_drives(),
+            clouds: cloud::detect(),
+            updater: Updater::new(),
+            hwnd: None,
             pending_copy_text: None,
             drives_at: Instant::now(),
+            clouds_at: Instant::now(),
+            restart_requested: false,
             dirty: false,
             last_save: Instant::now(),
             last_title: String::new(),
@@ -211,6 +260,35 @@ impl TabexApp {
         if self.drives_at.elapsed() > Duration::from_secs(10) {
             self.drives = list_drives();
             self.drives_at = Instant::now();
+        }
+        if self.clouds_at.elapsed() > Duration::from_secs(30) {
+            self.clouds = cloud::detect();
+            self.clouds_at = Instant::now();
+        }
+
+        // Atualizações: verificação automática (uma vez por dia) e aviso quando houver versão nova.
+        if self.session.auto_update {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now.saturating_sub(self.session.last_update_check) > 24 * 3600 {
+                self.session.last_update_check = now;
+                self.dirty = true;
+                self.updater.check();
+            }
+        }
+        if self.updater.is_busy() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        if !self.updater.notified {
+            if let UpdateState::Available(info) = self.updater.state() {
+                self.updater.notified = true;
+                self.toast(format!(
+                    "Nova versão {} disponível — veja em ⋯ › Atualizações",
+                    info.tag
+                ));
+            }
         }
     }
 
@@ -429,6 +507,107 @@ impl TabexApp {
                 }
             }
 
+            OpenInNewWindow(p) => {
+                self.session.new_window(None, None, p);
+                self.dirty = true;
+            }
+            NewWindow => {
+                let n = self.session.windows_created + 1;
+                self.dialog = Dialog::Window {
+                    index: None,
+                    name: format!("Janela {n}"),
+                    color: GroupColor::nth(n.saturating_sub(1)),
+                    first: true,
+                };
+            }
+            EditWindow(w) => {
+                if let Some(win) = self.session.windows.get(w) {
+                    self.dialog = Dialog::Window {
+                        index: Some(w),
+                        name: win.name.clone(),
+                        color: win.color,
+                        first: true,
+                    };
+                }
+            }
+            EditActiveWindow => {
+                let w = self.session.active_window;
+                self.apply(EditWindow(w));
+            }
+            SetWindowColor(w, c) => {
+                if let Some(win) = self.session.windows.get_mut(w) {
+                    win.color = c;
+                    self.dirty = true;
+                }
+            }
+            SwitchWindow(w) => {
+                self.session.switch_window(w);
+                self.dirty = true;
+            }
+            CycleWindow(d) => {
+                self.session.cycle_window(d);
+                self.dirty = true;
+            }
+            CloseWindow(w) => {
+                let tabs = self.session.close_window(w);
+                self.closed_tabs.extend(tabs);
+                self.closed_tabs.truncate(20);
+                self.dirty = true;
+            }
+            CloseActiveWindow => {
+                let w = self.session.active_window;
+                self.apply(CloseWindow(w));
+            }
+            MoveWindow(w, d) => {
+                self.session.move_window(w, d);
+                self.dirty = true;
+            }
+            MoveGroupToWindow { g, w } => {
+                self.session.move_group_to_window(g, w);
+                self.dirty = true;
+            }
+            MoveTabToWindow { g, t, w } => {
+                self.session.move_tab_to_window(g, t, w);
+                self.dirty = true;
+            }
+            MoveTabToNewWindow(g, t) => {
+                let path = match self.session.groups.get(g).and_then(|grp| grp.tabs.get(t)) {
+                    Some(tab) => tab.path.clone(),
+                    None => return,
+                };
+                // Fecha a aba na janela atual e abre uma janela nova nessa pasta.
+                self.session.close_tab(g, t);
+                self.session.new_window(None, None, path);
+                self.dirty = true;
+            }
+
+            NativeMenu { paths, folder } => self.native_menu(paths, folder),
+            ToggleNativeMenu => {
+                self.session.use_native_menu = !self.session.use_native_menu;
+                self.dirty = true;
+            }
+            CheckUpdates { manual } => {
+                self.updater.check();
+                if manual {
+                    self.dialog = Dialog::Update;
+                }
+            }
+            ShowUpdateDialog => self.dialog = Dialog::Update,
+            InstallUpdate => {
+                if let UpdateState::Available(info) = self.updater.state() {
+                    self.updater.install(info);
+                }
+                self.dialog = Dialog::Update;
+            }
+            RestartApp => match crate::update::spawn_new_instance() {
+                Ok(()) => self.restart_requested = true,
+                Err(e) => self.error(format!("Não foi possível reiniciar: {e}")),
+            },
+            ToggleAutoUpdate => {
+                self.session.auto_update = !self.session.auto_update;
+                self.dirty = true;
+            }
+
             Open(paths) => self.open_paths(paths),
             OpenSelected => {
                 let paths = self.session.active_tab().selected_paths();
@@ -602,6 +781,81 @@ impl TabexApp {
         }
     }
 
+    /// Usa o menu de contexto do Windows? (preferência + plataforma)
+    pub fn native_menu_enabled(&self) -> bool {
+        self.session.use_native_menu && platform::native_menu_supported()
+    }
+
+    fn native_menu(&mut self, paths: Vec<PathBuf>, folder: PathBuf) {
+        const OPEN_TAB: u32 = 1;
+        const OPEN_GROUP: u32 = 2;
+        const OPEN_WINDOW: u32 = 3;
+        const PIN: u32 = 4;
+        const BG_REFRESH: u32 = 11;
+        const BG_PIN: u32 = 12;
+        const BG_NEW_TAB: u32 = 13;
+        let single_dir = paths.len() == 1 && paths[0].is_dir();
+        let mut extras = Vec::new();
+        if paths.is_empty() {
+            extras.push(MenuExtra {
+                id: BG_NEW_TAB,
+                label: "Abrir esta pasta em nova aba".into(),
+            });
+            let pinned = self.session.is_pinned(&folder);
+            extras.push(MenuExtra {
+                id: BG_PIN,
+                label: if pinned {
+                    "Desafixar do Acesso rápido".into()
+                } else {
+                    "Fixar no Acesso rápido".into()
+                },
+            });
+            extras.push(MenuExtra {
+                id: BG_REFRESH,
+                label: "Atualizar\tF5".into(),
+            });
+        } else if single_dir {
+            extras.push(MenuExtra {
+                id: OPEN_TAB,
+                label: "Abrir em nova aba".into(),
+            });
+            extras.push(MenuExtra {
+                id: OPEN_GROUP,
+                label: "Abrir em novo grupo".into(),
+            });
+            extras.push(MenuExtra {
+                id: OPEN_WINDOW,
+                label: "Abrir em nova janela".into(),
+            });
+            let pinned = self.session.is_pinned(&paths[0]);
+            extras.push(MenuExtra {
+                id: PIN,
+                label: if pinned {
+                    "Desafixar do Acesso rápido".into()
+                } else {
+                    "Fixar no Acesso rápido".into()
+                },
+            });
+        }
+        match platform::show_native_menu(self.hwnd, &paths, &folder, &extras) {
+            Ok(r) => {
+                match r.extra {
+                    Some(OPEN_TAB) => self.apply(Action::OpenInNewTab(paths[0].clone())),
+                    Some(OPEN_GROUP) => self.apply(Action::OpenInNewGroup(paths[0].clone())),
+                    Some(OPEN_WINDOW) => self.apply(Action::OpenInNewWindow(paths[0].clone())),
+                    Some(PIN) => self.apply(Action::TogglePin(paths[0].clone())),
+                    Some(BG_REFRESH) => self.apply(Action::Refresh),
+                    Some(BG_PIN) => self.apply(Action::TogglePin(folder.clone())),
+                    Some(BG_NEW_TAB) => self.apply(Action::OpenInNewTab(folder.clone())),
+                    _ => {}
+                }
+                // O comando do shell pode ter alterado a pasta.
+                self.session.active_tab_mut().needs_reload = true;
+            }
+            Err(e) => self.toast(format!("Menu nativo indisponível: {e}")),
+        }
+    }
+
     fn show_properties(&mut self, entries: Vec<FileEntry>) {
         let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
         let info = ops::compute_properties(paths.clone());
@@ -614,7 +868,11 @@ impl TabexApp {
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let title = format!("{} - Tabex", self.session.active_tab().title());
+        let title = format!(
+            "{} · {} - Tabex",
+            self.session.active_tab().title(),
+            self.session.active_workspace().name
+        );
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
@@ -673,9 +931,26 @@ impl eframe::App for TabexApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let visuals = ctx.global_style().visuals.clone();
+        if self.hwnd.is_none() {
+            if let Ok(h) = frame.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    self.hwnd = Some(w.hwnd.get());
+                }
+            }
+        }
+
+        egui::Panel::top("windowbar")
+            .exact_size(ui::windowbar::HEIGHT)
+            .frame(egui::Frame::new().fill(visuals.panel_fill).inner_margin(egui::Margin {
+                left: 8,
+                right: 4,
+                top: 3,
+                bottom: 0,
+            }))
+            .show(ui, |ui| ui::windowbar::show(ui, self));
 
         egui::Panel::top("tabstrip")
             .exact_size(36.0)
@@ -742,6 +1017,11 @@ impl eframe::App for TabexApp {
         }
 
         self.update_title(&ctx);
+
+        if self.restart_requested {
+            let _ = self.session.save();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         if self.dirty && self.last_save.elapsed() > Duration::from_secs(2) {
             if let Err(e) = self.session.save() {
