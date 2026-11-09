@@ -59,6 +59,19 @@ pub enum Dialog {
         message: String,
     },
     Shortcuts,
+    /// Erro num item durante uma operação: Tentar novamente / Pular / Pular todos / Cancelar.
+    OpError {
+        path: PathBuf,
+        message: String,
+    },
+    /// Resumo de itens pulados ao fim de uma operação.
+    OpSummary {
+        failures: Vec<(PathBuf, String)>,
+    },
+    /// O Tabex fechou inesperadamente na execução anterior.
+    CrashReport {
+        text: String,
+    },
 }
 
 enum Outcome {
@@ -159,6 +172,9 @@ pub fn show(ctx: &Context, app: &mut TabexApp) {
         }
         Dialog::ConfirmDelete { paths, permanent } => confirm_delete(ctx, paths, *permanent, &mut actions),
         Dialog::Conflict { clip, dest, conflicts } => conflict_dialog(ctx, clip, dest, conflicts, &mut actions),
+        Dialog::OpError { path, message } => op_error_dialog(ctx, path, message, &mut actions),
+        Dialog::OpSummary { failures } => op_summary_dialog(ctx, failures, &mut actions),
+        Dialog::CrashReport { text } => crash_dialog(ctx, text, &mut actions),
         Dialog::Group {
             index,
             name,
@@ -695,6 +711,131 @@ fn conflict_dialog(
         return Outcome::Close;
     }
     result
+}
+
+fn op_error_dialog(ctx: &Context, path: &std::path::Path, message: &str, actions: &mut Vec<Action>) -> Outcome {
+    use crate::fs::ops::Decision;
+    let mut result = Outcome::Keep;
+    let m = Modal::new(Id::unique("dlg_op_error")).show(ctx, |ui| {
+        ui.set_width(520.0);
+        ui.heading("Problema com um item");
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(RichText::new(path.display().to_string()).strong()).wrap());
+        ui.add_space(4.0);
+        ui.label(RichText::new(message).color(ui.visuals().error_fg_color));
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            let mut pick = |d: Decision| {
+                actions.push(Action::OpDecision(d));
+                result = Outcome::Close;
+            };
+            if ui
+                .add(Button::new(RichText::new("Tentar novamente").strong()))
+                .clicked()
+            {
+                pick(Decision::Retry);
+            }
+            if ui
+                .button("Pular")
+                .on_hover_text("Continua com os próximos itens")
+                .clicked()
+            {
+                pick(Decision::Skip);
+            }
+            if ui
+                .button("Pular todos")
+                .on_hover_text("Pula este e qualquer outro item que falhar")
+                .clicked()
+            {
+                pick(Decision::SkipAll);
+            }
+            if ui.button("Cancelar operação").clicked() {
+                pick(Decision::Cancel);
+            }
+        });
+    });
+    // Esc não deve deixar a operação pendurada: equivale a "Pular".
+    if m.should_close() {
+        actions.push(Action::OpDecision(Decision::Skip));
+        return Outcome::Close;
+    }
+    result
+}
+
+fn op_summary_dialog(ctx: &Context, failures: &[(PathBuf, String)], actions: &mut Vec<Action>) -> Outcome {
+    let mut close = false;
+    let m = Modal::new(Id::unique("dlg_op_summary")).show(ctx, |ui| {
+        ui.set_width(560.0);
+        ui.heading(format!(
+            "Concluído com {} {} pulado{}",
+            failures.len(),
+            plural(failures.len(), "item", "itens"),
+            if failures.len() == 1 { "" } else { "s" }
+        ));
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            Grid::new("op_failures")
+                .num_columns(2)
+                .striped(true)
+                .spacing(vec2(12.0, 4.0))
+                .show(ui, |ui| {
+                    for (p, e) in failures.iter().take(300) {
+                        ui.add(egui::Label::new(p.display().to_string()).truncate());
+                        ui.label(RichText::new(e).small());
+                        ui.end_row();
+                    }
+                });
+        });
+        ui.add_space(10.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Fechar").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                close = true;
+            }
+            if ui.button("Abrir log").clicked() {
+                actions.push(Action::OpenLogFile);
+            }
+        });
+    });
+    if close || m.should_close() {
+        Outcome::Close
+    } else {
+        Outcome::Keep
+    }
+}
+
+fn crash_dialog(ctx: &Context, text: &str, actions: &mut Vec<Action>) -> Outcome {
+    let mut close = false;
+    let m = Modal::new(Id::unique("dlg_crash")).show(ctx, |ui| {
+        ui.set_width(520.0);
+        ui.heading("O Tabex fechou inesperadamente da última vez");
+        ui.add_space(6.0);
+        ui.label("Suas janelas, grupos e abas foram restaurados. Os detalhes do erro ficaram gravados no log:");
+        ui.add_space(4.0);
+        ui.weak(crate::log::log_path().display().to_string());
+        ui.add_space(6.0);
+        egui::Frame::new()
+            .fill(ui.visuals().extreme_bg_color)
+            .stroke(Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+            .corner_radius(4)
+            .inner_margin(6)
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(text.trim()).monospace().size(11.5)).wrap());
+            });
+        ui.add_space(12.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Fechar").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                close = true;
+            }
+            if ui.button("Abrir log").clicked() {
+                actions.push(Action::OpenLogFile);
+            }
+        });
+    });
+    if close || m.should_close() {
+        Outcome::Close
+    } else {
+        Outcome::Keep
+    }
 }
 
 fn properties(

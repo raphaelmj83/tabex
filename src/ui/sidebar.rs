@@ -7,7 +7,8 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     let mut actions: Vec<Action> = Vec::new();
     let current = app.session.active_tab().path.clone();
     let pinned = app.session.pinned.clone();
-    let drives = app.drives.clone();
+    let local: Vec<crate::fs::drives::DriveInfo> = app.drives.local().cloned().collect();
+    let network: Vec<crate::fs::drives::DriveInfo> = app.drives.network().cloned().collect();
     let clouds = app.clouds.clone();
     let ag = app.session.active_group;
     let aw = app.session.active_window;
@@ -150,10 +151,21 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
         CollapsingHeader::new(RichText::new("Este Computador").strong())
             .default_open(true)
             .show(ui, |ui| {
-                for (label, p) in &drives {
-                    item(ui, Icon::Drive, label, p, &current, false, &mut actions);
+                for d in &local {
+                    drive_item(ui, d, &current, &mut actions);
                 }
             });
+
+        if !network.is_empty() {
+            ui.add_space(6.0);
+            CollapsingHeader::new(RichText::new("Rede").strong())
+                .default_open(true)
+                .show(ui, |ui| {
+                    for d in &network {
+                        drive_item(ui, d, &current, &mut actions);
+                    }
+                });
+        }
     });
 
     app.pending.extend(actions);
@@ -161,9 +173,127 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
 
 enum Icon {
     Pinned,
-    Drive,
     Cloud(Color32),
     Glyph(&'static str),
+}
+
+/// Unidade/volume: ícone por tipo, nome, barra de uso e dica com espaço livre e caminho UNC.
+fn drive_item(ui: &mut Ui, d: &crate::fs::drives::DriveInfo, current: &Path, actions: &mut Vec<Action>) {
+    use crate::fs::drives::DriveKind;
+    use crate::fs::entry::format_size_human;
+    let selected = current == d.path;
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let visuals = ui.visuals().clone();
+    if selected {
+        ui.painter().rect_filled(rect, 4, visuals.selection.bg_fill);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 4, visuals.widgets.hovered.weak_bg_fill);
+    }
+    let icon_rect = egui::Rect::from_min_size(rect.min + vec2(8.0, 5.0), vec2(18.0, 16.0));
+    let glyph = match d.kind {
+        DriveKind::Fixed => "💽",
+        DriveKind::Removable => "💾",
+        DriveKind::Network => "🖧",
+        DriveKind::Optical => "💿",
+        DriveKind::Ram => "🧮",
+        DriveKind::Unknown => "💽",
+    };
+    let icon_color = if d.ready {
+        visuals.text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    ui.painter().text(
+        icon_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(14.0),
+        icon_color,
+    );
+    let text_color = if !d.ready {
+        visuals.weak_text_color()
+    } else if selected {
+        visuals.selection.stroke.color
+    } else {
+        visuals.text_color()
+    };
+    let text_rect = egui::Rect::from_min_size(rect.min + vec2(32.0, 1.0), vec2(rect.width() - 40.0, 18.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.add(
+        egui::Label::new(RichText::new(&d.name).color(text_color).size(13.0))
+            .truncate()
+            .selectable(false),
+    );
+    // Barra de uso
+    if let Some(frac) = d.used_fraction() {
+        let bar = egui::Rect::from_min_size(rect.min + vec2(32.0, 22.0), vec2((rect.width() - 44.0).max(20.0), 6.0));
+        ui.painter()
+            .rect_filled(bar, 3, visuals.widgets.inactive.bg_fill.linear_multiply(0.9));
+        let fill_color = if frac > 0.9 {
+            Color32::from_rgb(0xD9, 0x30, 0x25)
+        } else {
+            visuals.hyperlink_color
+        };
+        let mut filled = bar;
+        filled.set_width(bar.width() * frac);
+        ui.painter().rect_filled(filled, 3, fill_color);
+        ui.painter().rect_stroke(
+            bar,
+            3,
+            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+            egui::StrokeKind::Outside,
+        );
+    }
+    let mut tip = String::new();
+    if let Some(u) = &d.unc {
+        tip.push_str(&format!("{u}\n"));
+    }
+    tip.push_str(&format!("{}\n{}", d.kind.label(), d.path.display()));
+    if d.total > 0 {
+        tip.push_str(&format!(
+            "\n{} livres de {}",
+            format_size_human(d.free),
+            format_size_human(d.total)
+        ));
+    }
+    if !d.ready {
+        tip.push_str("\n(indisponível no momento)");
+    }
+    let resp = resp.on_hover_text(tip);
+    crate::ui::dnd::drop_target(ui, &resp, &d.path, actions);
+    if resp.clicked() {
+        actions.push(Action::Navigate(d.path.clone()));
+    }
+    if resp.middle_clicked() {
+        actions.push(Action::OpenInNewTab(d.path.clone()));
+    }
+    let p = d.path.clone();
+    let unc = d.unc.clone();
+    resp.context_menu(|ui| {
+        if ui.button("Abrir em nova aba").clicked() {
+            actions.push(Action::OpenInNewTab(p.clone()));
+        }
+        if ui.button("Abrir em nova janela").clicked() {
+            actions.push(Action::OpenInNewWindow(p.clone()));
+        }
+        if let Some(u) = &unc {
+            if ui.button("Abrir caminho de rede (UNC)").clicked() {
+                actions.push(Action::Navigate(PathBuf::from(u)));
+            }
+        }
+        ui.separator();
+        if ui.button("📌 Fixar no Acesso rápido").clicked() {
+            actions.push(Action::TogglePin(p.clone()));
+        }
+        if ui.button("ℹ Propriedades").clicked() {
+            actions.push(Action::OpenInNewTab(p.clone()));
+            actions.push(Action::PropertiesOfFolder);
+        }
+    });
 }
 
 fn item(ui: &mut Ui, icon: Icon, label: &str, path: &Path, current: &Path, is_pinned: bool, actions: &mut Vec<Action>) {
@@ -187,7 +317,6 @@ fn item(ui: &mut Ui, icon: Icon, label: &str, path: &Path, current: &Path, is_pi
                 visuals.text_color(),
             );
         }
-        Icon::Drive => crate::ui::icons::folder(ui.painter(), icon_rect),
         Icon::Cloud(color) => crate::ui::icons::cloud_folder(ui.painter(), icon_rect, color),
         Icon::Glyph(g) => {
             ui.painter().text(

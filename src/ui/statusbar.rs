@@ -2,11 +2,23 @@ use crate::app::{plural, TabexApp};
 use crate::fs::entry::{format_size_human, thousands};
 use egui::{Align, Layout, ProgressBar, RichText, Ui};
 
+/// "2 min", "45 s", "1 h 10 min".
+pub fn human_eta(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3600 {
+        format!("{} min", secs.div_ceil(60))
+    } else {
+        format!("{} h {} min", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     let tab = app.session.active_tab();
     let mut clear_filters = false;
     let mut show_update = false;
     let mut cancel = false;
+    let mut toggle_pause = false;
     let mut clear_queue = false;
     ui.horizontal(|ui| {
         let n = tab.visible_count();
@@ -55,17 +67,48 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
         for op in &app.ops {
             if let Ok(p) = op.progress.lock() {
                 ui.separator();
-                let frac = if p.total > 0 {
-                    p.done as f32 / p.total as f32
+                let paused = op.is_paused();
+                let text = if p.counting {
+                    format!("{}: calculando…", p.label)
+                } else if p.total_bytes > 0 {
+                    let mut t = format!(
+                        "{} {} de {} ({:.0}%)",
+                        p.label,
+                        format_size_human(p.done_bytes),
+                        format_size_human(p.total_bytes),
+                        p.fraction() * 100.0
+                    );
+                    if paused {
+                        t.push_str(" · pausado");
+                    } else {
+                        if let Some(sp) = p.speed() {
+                            t.push_str(&format!(" · {}/s", format_size_human(sp as u64)));
+                        }
+                        if let Some(eta) = p.eta_secs() {
+                            t.push_str(&format!(" · {}", human_eta(eta)));
+                        }
+                    }
+                    t
                 } else {
-                    0.0
+                    format!("{} {}/{}", p.label, p.done, p.total)
                 };
-                ui.add(
-                    ProgressBar::new(frac)
-                        .desired_width(160.0)
-                        .desired_height(14.0)
-                        .text(RichText::new(format!("{} {}", p.label, p.current)).small()),
-                );
+                let bar = ProgressBar::new(p.fraction())
+                    .desired_width(260.0)
+                    .desired_height(14.0)
+                    .animate(p.counting)
+                    .text(RichText::new(text).small());
+                ui.add(bar).on_hover_text(if p.current.is_empty() {
+                    p.label.clone()
+                } else {
+                    p.current.clone()
+                });
+                if ui
+                    .add(egui::Button::new(RichText::new(if paused { "▶" } else { "⏸" }).small()).frame(false))
+                    .on_hover_text(if paused { "Continuar" } else { "Pausar" })
+                    .clicked()
+                {
+                    toggle_pause = true;
+                }
                 if ui
                     .add(egui::Button::new(RichText::new("✕").small()).frame(false))
                     .on_hover_text("Cancelar operação")
@@ -135,6 +178,9 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     }
     if cancel {
         app.pending.push(crate::app::Action::CancelCurrentOp);
+    }
+    if toggle_pause {
+        app.pending.push(crate::app::Action::TogglePauseOp);
     }
     if clear_queue {
         app.pending.push(crate::app::Action::ClearQueue);

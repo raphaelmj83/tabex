@@ -328,7 +328,8 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
-/// Lista de unidades/raízes para a seção "Este Computador".
+/// Lista simples de unidades (substituída por `fs::drives`; mantida para referência/testes).
+#[allow(dead_code)]
 pub fn list_drives() -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     #[cfg(windows)]

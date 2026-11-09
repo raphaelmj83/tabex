@@ -59,6 +59,12 @@ pub struct OpProgress {
     pub label: String,
     pub done: usize,
     pub total: usize,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+    /// Instante em que a cópia de dados começou (para velocidade e tempo restante).
+    pub started: Option<std::time::Instant>,
+    /// Ainda contando itens/bytes (progresso indeterminado).
+    pub counting: bool,
     pub current: String,
     pub finished: bool,
     pub error: Option<String>,
@@ -66,6 +72,174 @@ pub struct OpProgress {
     pub pairs: Vec<(PathBuf, PathBuf)>,
     /// A operação foi cancelada pelo usuário (não é erro).
     pub cancelled: bool,
+    /// Itens pulados por decisão do usuário (caminho, erro).
+    pub failures: Vec<(PathBuf, String)>,
+}
+
+impl OpProgress {
+    /// Fração concluída (por bytes quando há, senão por itens).
+    pub fn fraction(&self) -> f32 {
+        if self.total_bytes > 0 {
+            (self.done_bytes as f64 / self.total_bytes as f64).clamp(0.0, 1.0) as f32
+        } else if self.total > 0 {
+            (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Bytes por segundo desde o início da transferência.
+    pub fn speed(&self) -> Option<f64> {
+        let secs = self.started?.elapsed().as_secs_f64();
+        if secs < 0.5 || self.done_bytes == 0 {
+            return None;
+        }
+        Some(self.done_bytes as f64 / secs)
+    }
+
+    /// Segundos restantes estimados.
+    pub fn eta_secs(&self) -> Option<u64> {
+        let speed = self.speed()?;
+        if self.total_bytes <= self.done_bytes || speed <= 0.0 {
+            return None;
+        }
+        Some(((self.total_bytes - self.done_bytes) as f64 / speed) as u64)
+    }
+}
+
+/// Decisão do usuário diante de um erro em um item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Retry,
+    Skip,
+    SkipAll,
+    Cancel,
+}
+
+/// Controle compartilhado entre a interface e a thread da operação: cancelar, pausar e
+/// perguntar o que fazer quando um item falha.
+#[derive(Default)]
+pub struct OpControl {
+    pub cancel: AtomicBool,
+    pub paused: AtomicBool,
+    skip_all: AtomicBool,
+    pending: Mutex<Option<(PathBuf, String)>>,
+    decision: Mutex<Option<Decision>>,
+    cv: std::sync::Condvar,
+}
+
+impl OpControl {
+    pub fn new() -> Arc<OpControl> {
+        Arc::new(OpControl::default())
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cv.notify_all();
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Erro aguardando decisão (caminho, mensagem).
+    pub fn pending_error(&self) -> Option<(PathBuf, String)> {
+        self.pending.lock().ok().and_then(|p| p.clone())
+    }
+
+    /// Responde ao erro pendente.
+    pub fn decide(&self, d: Decision) {
+        if d == Decision::SkipAll {
+            self.skip_all.store(true, Ordering::Relaxed);
+        }
+        if d == Decision::Cancel {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Ok(mut slot) = self.decision.lock() {
+            *slot = Some(d);
+        }
+        self.cv.notify_all();
+    }
+
+    /// Cancelado? Se pausado, espera. Chamado com frequência pela thread da operação.
+    fn check(&self) -> io::Result<()> {
+        loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(io::Error::other(CANCEL_MSG));
+            }
+            if !self.paused.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Pergunta ao usuário o que fazer com `err` em `path`. Bloqueia a thread da operação.
+    fn ask(&self, path: &Path, err: &io::Error) -> Decision {
+        if self.skip_all.load(Ordering::Relaxed) {
+            return Decision::Skip;
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            return Decision::Cancel;
+        }
+        if let Ok(mut p) = self.pending.lock() {
+            *p = Some((path.to_path_buf(), err.to_string()));
+        }
+        let mut guard = self.decision.lock().unwrap_or_else(|e| e.into_inner());
+        let result = loop {
+            if let Some(d) = guard.take() {
+                break d;
+            }
+            if self.cancel.load(Ordering::Relaxed) {
+                break Decision::Cancel;
+            }
+            let (g, _) = self
+                .cv
+                .wait_timeout(guard, std::time::Duration::from_millis(250))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+        };
+        drop(guard);
+        if let Ok(mut p) = self.pending.lock() {
+            *p = None;
+        }
+        result
+    }
+}
+
+/// Resultado de um item sob a política "perguntar ao usuário".
+enum ItemOutcome {
+    Done,
+    Skipped,
+}
+
+/// Executa `f` para `path`; em erro, pergunta (Tentar novamente / Pular / Pular todos / Cancelar).
+fn with_retry(
+    ctrl: &OpControl,
+    progress: &Arc<Mutex<OpProgress>>,
+    path: &Path,
+    mut f: impl FnMut() -> io::Result<()>,
+) -> io::Result<ItemOutcome> {
+    loop {
+        match f() {
+            Ok(()) => return Ok(ItemOutcome::Done),
+            Err(e) if e.to_string().contains(CANCEL_MSG) => return Err(e),
+            Err(e) => match ctrl.ask(path, &e) {
+                Decision::Retry => continue,
+                Decision::Skip | Decision::SkipAll => {
+                    if let Ok(mut p) = progress.lock() {
+                        p.failures.push((path.to_path_buf(), e.to_string()));
+                    }
+                    return Ok(ItemOutcome::Skipped);
+                }
+                Decision::Cancel => return Err(io::Error::other(CANCEL_MSG)),
+            },
+        }
+    }
 }
 
 /// Uma operação que pode ser desfeita (ou refeita).
@@ -119,7 +293,8 @@ pub struct OpJob {
     pub refresh: Vec<PathBuf>,
     pub undo: UndoTemplate,
     pub push_to: Stack,
-    pub cancel: Arc<AtomicBool>,
+    pub control: Arc<OpControl>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Operação ainda não iniciada (fila).
@@ -167,23 +342,44 @@ impl QueuedOp {
     }
 }
 
-fn cancelled(cancel: &AtomicBool) -> io::Result<()> {
-    if cancel.load(Ordering::Relaxed) {
-        Err(io::Error::other(CANCEL_MSG))
-    } else {
-        Ok(())
-    }
-}
-
 const CANCEL_MSG: &str = "__cancelado__";
 
 impl OpJob {
+    /// Terminou? Também detecta a thread ter morrido (pânico) sem marcar o fim.
     pub fn is_finished(&self) -> bool {
-        self.progress.lock().map(|p| p.finished).unwrap_or(true)
+        let finished = self.progress.lock().map(|p| p.finished).unwrap_or(true);
+        if finished {
+            return true;
+        }
+        if self.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false) {
+            if let Ok(mut p) = self.progress.lock() {
+                p.finished = true;
+                p.error =
+                    Some("A operação terminou inesperadamente. Veja tabex.log na pasta de configuração.".to_owned());
+            }
+            return true;
+        }
+        false
     }
 
     pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.control.request_cancel();
+    }
+
+    pub fn toggle_pause(&self) {
+        self.control.set_paused(!self.control.is_paused());
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.control.is_paused()
+    }
+
+    pub fn pending_error(&self) -> Option<(PathBuf, String)> {
+        self.control.pending_error()
+    }
+
+    pub fn decide(&self, d: Decision) {
+        self.control.decide(d);
     }
 
     /// Entrada de desfazer/refazer resultante (só faz sentido após terminar sem erro).
@@ -235,16 +431,47 @@ fn finish(progress: &Arc<Mutex<OpProgress>>, result: Result<(), String>) {
     }
 }
 
-fn count_items(paths: &[PathBuf]) -> usize {
-    let mut n = 0;
+/// Conta itens e bytes (arquivos) de `paths`, recursivamente.
+fn count_items_bytes(paths: &[PathBuf], ctrl: &OpControl) -> (usize, u64) {
+    let mut n = 0usize;
+    let mut bytes = 0u64;
     for p in paths {
+        if ctrl.cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if p.is_dir() {
-            n += walkdir::WalkDir::new(p).into_iter().filter_map(Result::ok).count();
+            for e in walkdir::WalkDir::new(p).into_iter().filter_map(Result::ok) {
+                n += 1;
+                if let Ok(md) = e.metadata() {
+                    if md.is_file() {
+                        bytes += md.len();
+                    }
+                }
+            }
         } else {
             n += 1;
+            bytes += fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         }
     }
-    n.max(1)
+    (n.max(1), bytes)
+}
+
+#[allow(dead_code)]
+fn count_items(paths: &[PathBuf]) -> usize {
+    count_items_bytes(paths, &OpControl::default()).0
+}
+
+fn begin_counting(progress: &Arc<Mutex<OpProgress>>, paths: &[PathBuf], ctrl: &OpControl) {
+    if let Ok(mut p) = progress.lock() {
+        p.counting = true;
+    }
+    let (n, bytes) = count_items_bytes(paths, ctrl);
+    if let Ok(mut p) = progress.lock() {
+        p.total = n;
+        p.total_bytes = bytes;
+        p.counting = false;
+        p.started = Some(std::time::Instant::now());
+    }
 }
 
 fn set_current(progress: &Arc<Mutex<OpProgress>>, path: &Path) {
@@ -262,62 +489,129 @@ fn tick(progress: &Arc<Mutex<OpProgress>>) {
     }
 }
 
-fn copy_recursive(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>) -> io::Result<()> {
-    copy_recursive_c(src, dst, progress, &AtomicBool::new(false))
+fn add_bytes(progress: &Arc<Mutex<OpProgress>>, n: u64) {
+    if let Ok(mut p) = progress.lock() {
+        p.done_bytes += n;
+    }
 }
 
-fn copy_recursive_c(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>, cancel: &AtomicBool) -> io::Result<()> {
-    cancelled(cancel)?;
+/// Copia um arquivo em blocos, atualizando bytes e respeitando pausa/cancelamento.
+/// Preserva a data de modificação. Remove o destino parcial em caso de erro.
+fn copy_file(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>, ctrl: &OpControl) -> io::Result<()> {
+    use std::io::{Read, Write};
+    const CHUNK: usize = 4 * 1024 * 1024;
+    let mut input = fs::File::open(src)?;
+    let md = input.metadata()?;
+    if dst.is_dir() {
+        fs::remove_dir_all(dst)?;
+    }
+    let result = (|| -> io::Result<()> {
+        let mut output = fs::File::create(dst)?;
+        let mut buf = vec![0u8; CHUNK.min(md.len().max(64 * 1024) as usize)];
+        loop {
+            ctrl.check()?;
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            output.write_all(&buf[..n])?;
+            add_bytes(progress, n as u64);
+        }
+        output.flush()?;
+        if let Ok(m) = md.modified() {
+            let _ = output.set_modified(m);
+        }
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(dst, md.permissions());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(dst);
+    }
+    result
+}
+
+#[allow(dead_code)]
+fn copy_recursive(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>) -> io::Result<()> {
+    copy_recursive_c(src, dst, progress, &OpControl::default())
+}
+
+/// Copia `src` em `dst`. Erros por item perguntam ao usuário (pular / tentar de novo / cancelar).
+fn copy_recursive_c(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>, ctrl: &OpControl) -> io::Result<()> {
+    ctrl.check()?;
     set_current(progress, src);
-    let md = fs::metadata(src)?;
+    let md = match with_retry(ctrl, progress, src, || fs::metadata(src).map(|_| ()))? {
+        ItemOutcome::Done => fs::metadata(src)?,
+        ItemOutcome::Skipped => return Ok(()),
+    };
     if md.is_dir() {
-        fs::create_dir_all(dst)?;
+        if let ItemOutcome::Skipped = with_retry(ctrl, progress, dst, || fs::create_dir_all(dst))? {
+            return Ok(());
+        }
         tick(progress);
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy_recursive_c(&entry.path(), &dst.join(entry.file_name()), progress, cancel)?;
+        let entries: Vec<fs::DirEntry> = match fs::read_dir(src) {
+            Ok(rd) => rd.flatten().collect(),
+            Err(e) => match ctrl.ask(src, &e) {
+                Decision::Cancel => return Err(io::Error::other(CANCEL_MSG)),
+                _ => {
+                    if let Ok(mut p) = progress.lock() {
+                        p.failures.push((src.to_path_buf(), e.to_string()));
+                    }
+                    return Ok(());
+                }
+            },
+        };
+        for entry in entries {
+            copy_recursive_c(&entry.path(), &dst.join(entry.file_name()), progress, ctrl)?;
         }
     } else {
-        if dst.is_dir() {
-            fs::remove_dir_all(dst)?;
-        }
-        fs::copy(src, dst)?;
+        with_retry(ctrl, progress, src, || copy_file(src, dst, progress, ctrl))?;
         tick(progress);
     }
     Ok(())
 }
 
+#[allow(dead_code)]
 fn move_path(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>) -> io::Result<()> {
-    move_path_c(src, dst, progress, &AtomicBool::new(false))
+    move_path_c(src, dst, progress, &OpControl::default())
 }
 
-fn move_path_c(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>, cancel: &AtomicBool) -> io::Result<()> {
-    cancelled(cancel)?;
+fn move_path_c(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>, ctrl: &OpControl) -> io::Result<()> {
+    ctrl.check()?;
     set_current(progress, src);
     if dst.exists() && !(src.is_dir() && dst.is_dir()) {
         // Substituir arquivo: remove o destino antes do rename.
-        remove_any(dst)?;
+        if let ItemOutcome::Skipped = with_retry(ctrl, progress, dst, || remove_any(dst))? {
+            return Ok(());
+        }
     }
     if src.is_dir() && dst.is_dir() {
         // Mesclar pasta em pasta existente.
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            move_path_c(&entry.path(), &dst.join(entry.file_name()), progress, cancel)?;
+        let entries: Vec<fs::DirEntry> = fs::read_dir(src)?.flatten().collect();
+        for entry in entries {
+            move_path_c(&entry.path(), &dst.join(entry.file_name()), progress, ctrl)?;
         }
-        return fs::remove_dir(src);
+        let _ = fs::remove_dir(src);
+        return Ok(());
     }
     match fs::rename(src, dst) {
         Ok(()) => {
             tick(progress);
+            // Mover no mesmo volume é instantâneo: conta os bytes de uma vez.
+            if let Ok(md) = fs::metadata(dst) {
+                if md.is_file() {
+                    add_bytes(progress, md.len());
+                }
+            }
             Ok(())
         }
         Err(_) => {
             // Provavelmente outro volume: copia e remove.
-            copy_recursive_c(src, dst, progress, cancel)?;
-            if src.is_dir() {
-                fs::remove_dir_all(src)
-            } else {
-                fs::remove_file(src)
+            copy_recursive_c(src, dst, progress, ctrl)?;
+            match with_retry(ctrl, progress, src, || remove_any(src))? {
+                ItemOutcome::Done | ItemOutcome::Skipped => Ok(()),
             }
         }
     }
@@ -374,8 +668,8 @@ pub fn start_paste_with(clip: &Clipboard, dest: &Path, policy: ConflictPolicy) -
     let paths = clip.paths.clone();
     let cut = clip.cut;
     let dest = dest.to_path_buf();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_t = cancel.clone();
+    let control = OpControl::new();
+    let ctrl = control.clone();
     let progress = Arc::new(Mutex::new(OpProgress {
         label: if cut {
             "Movendo".to_owned()
@@ -391,52 +685,53 @@ pub fn start_paste_with(clip: &Clipboard, dest: &Path, policy: ConflictPolicy) -
         }
     }
     let prog = progress.clone();
-    std::thread::spawn(move || {
-        let result = (|| -> io::Result<()> {
-            if let Ok(mut p) = prog.lock() {
-                p.total = count_items(&paths);
-            }
-            for src in &paths {
-                let Some(name) = src.file_name() else { continue };
-                let name = name.to_string_lossy().into_owned();
-                if dest.starts_with(src) {
-                    return Err(io::Error::other(format!(
-                        "Não é possível copiar \"{name}\" para dentro dela mesma."
-                    )));
-                }
-                let same_dir = src.parent().map(|p| p == dest).unwrap_or(false);
-                let plain = dest.join(&name);
-                let conflict = !same_dir && plain.exists();
-                if conflict && policy == ConflictPolicy::Skip {
-                    continue;
-                }
-                if cut {
-                    if same_dir {
+    let handle = std::thread::Builder::new()
+        .name("tabex-op".into())
+        .spawn(move || {
+            let result = (|| -> io::Result<()> {
+                begin_counting(&prog, &paths, &ctrl);
+                for src in &paths {
+                    let Some(name) = src.file_name() else { continue };
+                    let name = name.to_string_lossy().into_owned();
+                    if dest.starts_with(src) {
+                        return Err(io::Error::other(format!(
+                            "Não é possível copiar \"{name}\" para dentro dela mesma."
+                        )));
+                    }
+                    let same_dir = src.parent().map(|p| p == dest).unwrap_or(false);
+                    let plain = dest.join(&name);
+                    let conflict = !same_dir && plain.exists();
+                    if conflict && policy == ConflictPolicy::Skip {
                         continue;
                     }
-                    let dst = if conflict && policy == ConflictPolicy::Replace {
-                        plain
+                    if cut {
+                        if same_dir {
+                            continue;
+                        }
+                        let dst = if conflict && policy == ConflictPolicy::Replace {
+                            plain
+                        } else {
+                            unique_path(&dest, &name)
+                        };
+                        move_path_c(src, &dst, &prog, &ctrl)?;
+                        record_pair(&prog, src, &dst);
                     } else {
-                        unique_path(&dest, &name)
-                    };
-                    move_path_c(src, &dst, &prog, &cancel_t)?;
-                    record_pair(&prog, src, &dst);
-                } else {
-                    let dst = if same_dir {
-                        copy_name(&dest, &name)
-                    } else if conflict && policy == ConflictPolicy::Replace {
-                        plain
-                    } else {
-                        unique_path(&dest, &name)
-                    };
-                    copy_recursive_c(src, &dst, &prog, &cancel_t)?;
-                    record_pair(&prog, src, &dst);
+                        let dst = if same_dir {
+                            copy_name(&dest, &name)
+                        } else if conflict && policy == ConflictPolicy::Replace {
+                            plain
+                        } else {
+                            unique_path(&dest, &name)
+                        };
+                        copy_recursive_c(src, &dst, &prog, &ctrl)?;
+                        record_pair(&prog, src, &dst);
+                    }
                 }
-            }
-            Ok(())
-        })();
-        finish(&prog, result.map_err(|e| e.to_string()));
-    });
+                Ok(())
+            })();
+            finish(&prog, result.map_err(|e| e.to_string()));
+        })
+        .ok();
     // Substituir destrói os originais do destino: não há como desfazer com segurança.
     let undo = if policy == ConflictPolicy::Replace {
         UndoTemplate::None
@@ -450,7 +745,8 @@ pub fn start_paste_with(clip: &Clipboard, dest: &Path, policy: ConflictPolicy) -
         refresh,
         undo,
         push_to: Stack::Undo,
-        cancel,
+        control,
+        handle,
     }
 }
 
@@ -463,34 +759,38 @@ pub fn start_delete(paths: Vec<PathBuf>, permanent: bool) -> OpJob {
             "Movendo para a Lixeira".to_owned()
         },
         total: paths.len().max(1),
+        started: Some(std::time::Instant::now()),
         ..Default::default()
     }));
     let refresh: Vec<PathBuf> = paths.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
     let paths_for_undo = paths.clone();
+    let control = OpControl::new();
+    let ctrl = control.clone();
     let prog = progress.clone();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<(), String> {
-            if permanent {
-                for p in &paths {
-                    set_current(&prog, p);
-                    let r = if p.is_dir() {
-                        fs::remove_dir_all(p)
-                    } else {
-                        fs::remove_file(p)
-                    };
-                    r.map_err(|e| format!("{}: {e}", p.display()))?;
-                    tick(&prog);
+    let handle = std::thread::Builder::new()
+        .name("tabex-op".into())
+        .spawn(move || {
+            let result = (|| -> io::Result<()> {
+                if permanent {
+                    for p in &paths {
+                        ctrl.check()?;
+                        set_current(&prog, p);
+                        with_retry(&ctrl, &prog, p, || remove_any(p))?;
+                        tick(&prog);
+                    }
+                } else {
+                    for p in &paths {
+                        ctrl.check()?;
+                        set_current(&prog, p);
+                        with_retry(&ctrl, &prog, p, || trash::delete(p).map_err(io::Error::other))?;
+                        tick(&prog);
+                    }
                 }
-            } else {
-                trash::delete_all(&paths).map_err(|e| e.to_string())?;
-                if let Ok(mut p) = prog.lock() {
-                    p.done = p.total;
-                }
-            }
-            Ok(())
-        })();
-        finish(&prog, result);
-    });
+                Ok(())
+            })();
+            finish(&prog, result.map_err(|e| e.to_string()));
+        })
+        .ok();
     let undo = if permanent {
         UndoTemplate::None
     } else {
@@ -501,7 +801,8 @@ pub fn start_delete(paths: Vec<PathBuf>, permanent: bool) -> OpJob {
         refresh,
         undo,
         push_to: Stack::Undo,
-        cancel: Arc::new(AtomicBool::new(false)),
+        control,
+        handle,
     }
 }
 
@@ -623,87 +924,95 @@ pub fn start_undo_redo(entry: UndoEntry, undo: bool) -> OpJob {
     let refresh = touched_dirs(&entry.kind);
     let prog = progress.clone();
     let kind = entry.kind.clone();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<(), String> {
-            match (&kind, undo) {
-                (UndoKind::Rename { from, to }, true) => {
-                    fs::rename(to, from).map_err(|e| format!("Renomear de volta: {e}"))
-                }
-                (UndoKind::Rename { from, to }, false) => fs::rename(from, to).map_err(|e| format!("Renomear: {e}")),
-                (UndoKind::Move { pairs }, _) => {
-                    if let Ok(mut p) = prog.lock() {
-                        p.total = pairs.len().max(1);
+    let control = OpControl::new();
+    let ctrl = control.clone();
+    let handle = std::thread::Builder::new()
+        .name("tabex-op".into())
+        .spawn(move || {
+            let result = (|| -> Result<(), String> {
+                match (&kind, undo) {
+                    (UndoKind::Rename { from, to }, true) => {
+                        fs::rename(to, from).map_err(|e| format!("Renomear de volta: {e}"))
                     }
-                    for (src, dst) in pairs {
-                        let (a, b) = if undo { (dst, src) } else { (src, dst) };
-                        if b.exists() {
-                            return Err(format!(
-                                "\"{}\" já existe; não foi possível mover de volta.",
-                                b.display()
-                            ));
+                    (UndoKind::Rename { from, to }, false) => {
+                        fs::rename(from, to).map_err(|e| format!("Renomear: {e}"))
+                    }
+                    (UndoKind::Move { pairs }, _) => {
+                        if let Ok(mut p) = prog.lock() {
+                            p.total = pairs.len().max(1);
                         }
-                        move_path(a, b, &prog).map_err(|e| format!("{}: {e}", a.display()))?;
-                    }
-                    Ok(())
-                }
-                (UndoKind::Copy { pairs }, true) => {
-                    for (_, dst) in pairs {
-                        set_current(&prog, dst);
-                        if dst.exists() {
-                            remove_any(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+                        for (src, dst) in pairs {
+                            let (a, b) = if undo { (dst, src) } else { (src, dst) };
+                            if b.exists() {
+                                return Err(format!(
+                                    "\"{}\" já existe; não foi possível mover de volta.",
+                                    b.display()
+                                ));
+                            }
+                            move_path_c(a, b, &prog, &ctrl).map_err(|e| format!("{}: {e}", a.display()))?;
                         }
-                        tick(&prog);
+                        Ok(())
                     }
-                    Ok(())
+                    (UndoKind::Copy { pairs }, true) => {
+                        for (_, dst) in pairs {
+                            set_current(&prog, dst);
+                            if dst.exists() {
+                                remove_any(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+                            }
+                            tick(&prog);
+                        }
+                        Ok(())
+                    }
+                    (UndoKind::Copy { pairs }, false) => {
+                        if let Ok(mut p) = prog.lock() {
+                            p.total = count_items(&pairs.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>());
+                        }
+                        for (src, dst) in pairs {
+                            copy_recursive_c(src, dst, &prog, &ctrl).map_err(|e| format!("{}: {e}", src.display()))?;
+                        }
+                        Ok(())
+                    }
+                    (UndoKind::Create { path, is_dir }, true) => {
+                        set_current(&prog, path);
+                        if !path.exists() {
+                            return Ok(());
+                        }
+                        let untouched = if *is_dir {
+                            fs::read_dir(path).map(|mut r| r.next().is_none()).unwrap_or(false)
+                        } else {
+                            fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false)
+                        };
+                        if untouched {
+                            remove_any(path).map_err(|e| e.to_string())
+                        } else {
+                            // Já tem conteúdo: vai para a Lixeira em vez de apagar de vez.
+                            trash::delete(path).map_err(|e| e.to_string())
+                        }
+                    }
+                    (UndoKind::Create { path, is_dir }, false) => {
+                        if *is_dir {
+                            fs::create_dir(path).map_err(|e| e.to_string())
+                        } else {
+                            fs::File::create(path).map(|_| ()).map_err(|e| e.to_string())
+                        }
+                    }
+                    (UndoKind::Trash { paths }, true) => restore_from_trash(paths),
+                    (UndoKind::Trash { paths }, false) => trash::delete_all(paths).map_err(|e| e.to_string()),
                 }
-                (UndoKind::Copy { pairs }, false) => {
-                    if let Ok(mut p) = prog.lock() {
-                        p.total = count_items(&pairs.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>());
-                    }
-                    for (src, dst) in pairs {
-                        copy_recursive(src, dst, &prog).map_err(|e| format!("{}: {e}", src.display()))?;
-                    }
-                    Ok(())
-                }
-                (UndoKind::Create { path, is_dir }, true) => {
-                    set_current(&prog, path);
-                    if !path.exists() {
-                        return Ok(());
-                    }
-                    let untouched = if *is_dir {
-                        fs::read_dir(path).map(|mut r| r.next().is_none()).unwrap_or(false)
-                    } else {
-                        fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false)
-                    };
-                    if untouched {
-                        remove_any(path).map_err(|e| e.to_string())
-                    } else {
-                        // Já tem conteúdo: vai para a Lixeira em vez de apagar de vez.
-                        trash::delete(path).map_err(|e| e.to_string())
-                    }
-                }
-                (UndoKind::Create { path, is_dir }, false) => {
-                    if *is_dir {
-                        fs::create_dir(path).map_err(|e| e.to_string())
-                    } else {
-                        fs::File::create(path).map(|_| ()).map_err(|e| e.to_string())
-                    }
-                }
-                (UndoKind::Trash { paths }, true) => restore_from_trash(paths),
-                (UndoKind::Trash { paths }, false) => trash::delete_all(paths).map_err(|e| e.to_string()),
+            })();
+            if let Ok(mut p) = prog.lock() {
+                p.done = p.total;
             }
-        })();
-        if let Ok(mut p) = prog.lock() {
-            p.done = p.total;
-        }
-        finish(&prog, result);
-    });
+            finish(&prog, result);
+        })
+        .ok();
     OpJob {
         progress,
         refresh,
         undo: UndoTemplate::Fixed(entry),
         push_to: if undo { Stack::Redo } else { Stack::Undo },
-        cancel: Arc::new(AtomicBool::new(false)),
+        control,
+        handle,
     }
 }
 
@@ -915,6 +1224,39 @@ mod tests {
         let job = start_paste_with(&clip, &folder, ConflictPolicy::KeepBoth);
         wait(&job);
         assert!(folder.join("conf (2).txt").exists());
+
+        // erro por item: pergunta e respeita "Pular"
+        let locked_dir = dir.join("semacesso");
+        fs::create_dir_all(&locked_dir).unwrap();
+        let ghost = dir.join("fantasma.txt");
+        let clip = Clipboard {
+            paths: vec![ghost.clone(), renamed.clone()],
+            cut: false,
+        };
+        let job = start_paste_with(&clip, &locked_dir, ConflictPolicy::KeepBoth);
+        let mut asked = false;
+        for _ in 0..200 {
+            if let Some((p, _)) = job.pending_error() {
+                assert_eq!(p, ghost);
+                job.decide(Decision::Skip);
+                asked = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(asked, "deveria perguntar sobre o arquivo inexistente");
+        wait(&job);
+        let p = job.progress.lock().unwrap();
+        assert!(p.error.is_none());
+        assert_eq!(p.failures.len(), 1);
+        assert!(
+            p.total_bytes > 0 && p.done_bytes == p.total_bytes,
+            "bytes {}/{}",
+            p.done_bytes,
+            p.total_bytes
+        );
+        drop(p);
+        assert!(locked_dir.join("renomeado.txt").exists());
 
         // cancelar: a flag interrompe e marca como cancelado, sem erro
         let big = dir.join("big");

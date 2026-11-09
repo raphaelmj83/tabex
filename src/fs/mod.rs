@@ -1,4 +1,5 @@
 pub mod cloud;
+pub mod drives;
 pub mod entry;
 pub mod filter;
 pub mod ops;

@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod fs;
+pub mod log;
 pub mod model;
 pub mod platform;
 pub mod shortcuts;

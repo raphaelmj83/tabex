@@ -1,5 +1,7 @@
 use crate::fs::cloud::{self, CloudFolder};
-use crate::fs::entry::{list_drives, FileEntry};
+use crate::fs::drives::DriveService;
+use crate::fs::entry::FileEntry;
+use crate::fs::ops::Decision;
 use crate::fs::ops::{self, Clipboard, ConflictPolicy, OpJob, QueuedOp, Stack, UndoEntry};
 use crate::fs::sysclip;
 use crate::fs::thumbs::ThumbService;
@@ -114,7 +116,11 @@ pub enum Action {
         policy: ConflictPolicy,
     },
     CancelCurrentOp,
+    TogglePauseOp,
     ClearQueue,
+    /// Resposta ao erro pendente da operação atual.
+    OpDecision(Decision),
+    OpenLogFile,
     /// Arquivos soltos de fora (Explorer) na pasta `dest`; `cut` move em vez de copiar.
     DropFiles {
         paths: Vec<PathBuf>,
@@ -172,7 +178,7 @@ pub struct TabexApp {
     pub pending: Vec<Action>,
     pub closed_tabs: Vec<Tab>,
     pub toast: Option<(String, Instant)>,
-    pub drives: Vec<(String, PathBuf)>,
+    pub drives: DriveService,
     pub clouds: Vec<CloudFolder>,
     pub updater: Updater,
     pub hwnd: Option<isize>,
@@ -210,11 +216,20 @@ impl TabexApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let session = Session::load();
         ui::theme::apply(&cc.egui_ctx, session.dark_theme);
+        crate::log::info(format!(
+            "Tabex {} iniciado ({} janelas)",
+            env!("CARGO_PKG_VERSION"),
+            session.windows.len()
+        ));
+        let dialog = match crate::log::take_last_crash() {
+            Some(text) => Dialog::CrashReport { text },
+            None => Dialog::None,
+        };
         TabexApp {
             theme_applied: Some(session.dark_theme),
             session,
             clipboard: None,
-            dialog: Dialog::None,
+            dialog,
             ops: Vec::new(),
             address_edit: None,
             focus_address: false,
@@ -222,7 +237,7 @@ impl TabexApp {
             pending: Vec::new(),
             closed_tabs: Vec::new(),
             toast: None,
-            drives: list_drives(),
+            drives: DriveService::new(),
             clouds: cloud::detect(),
             updater: Updater::new(),
             hwnd: None,
@@ -268,7 +283,7 @@ impl TabexApp {
             pending: Vec::new(),
             closed_tabs: Vec::new(),
             toast: None,
-            drives: Vec::new(),
+            drives: DriveService::new(),
             clouds: Vec::new(),
             updater: Updater::new(),
             hwnd: None,
@@ -311,9 +326,11 @@ impl TabexApp {
     }
 
     pub fn error(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        crate::log::warn(&msg);
         self.dialog = Dialog::Error {
             title: "Tabex".to_owned(),
-            message: msg.into(),
+            message: msg,
         };
     }
 
@@ -343,16 +360,21 @@ impl TabexApp {
                 } else {
                     None
                 };
-                finished.push((op.refresh.clone(), err, entry, op.push_to, cancelled));
+                let failures = op.progress.lock().map(|p| p.failures.clone()).unwrap_or_default();
+                finished.push((op.refresh.clone(), err, entry, op.push_to, cancelled, failures));
                 false
             } else {
                 true
             }
         });
-        for (dirs, err, entry, stack, cancelled) in finished {
+        for (dirs, err, entry, stack, cancelled, failures) in finished {
             self.refresh_dirs(&dirs);
             if cancelled {
                 self.toast("Operação cancelada");
+            }
+            if !failures.is_empty() && err.is_none() {
+                crate::log::warn(format!("operação concluída com {} item(ns) pulado(s)", failures.len()));
+                self.dialog = Dialog::OpSummary { failures };
             }
             if let Some(e) = err {
                 self.error(e);
@@ -372,6 +394,12 @@ impl TabexApp {
             }
         }
         self.sys_clip_has_files = sysclip::has_files();
+        // Erro aguardando decisão do usuário?
+        if matches!(self.dialog, Dialog::None) {
+            if let Some((path, msg)) = self.ops.iter().find_map(|op| op.pending_error()) {
+                self.dialog = Dialog::OpError { path, message: msg };
+            }
+        }
         // Fila: uma operação por vez.
         if self.ops.is_empty() {
             if let Some(next) = self.op_queue.pop_front() {
@@ -437,10 +465,10 @@ impl TabexApp {
             ctx.request_repaint_after(Duration::from_millis(5000));
         }
 
-        if self.drives_at.elapsed() > Duration::from_secs(10) {
-            self.drives = list_drives();
-            self.drives_at = Instant::now();
+        if self.drives.poll() {
+            ctx.request_repaint();
         }
+        let _ = self.drives_at;
         if self.clouds_at.elapsed() > Duration::from_secs(30) {
             self.clouds = cloud::detect();
             self.clouds_at = Instant::now();
@@ -930,6 +958,29 @@ impl TabexApp {
             CancelCurrentOp => {
                 for op in &self.ops {
                     op.request_cancel();
+                }
+            }
+            TogglePauseOp => {
+                for op in &self.ops {
+                    op.toggle_pause();
+                }
+            }
+            OpDecision(d) => {
+                for op in &self.ops {
+                    if op.pending_error().is_some() {
+                        op.decide(d);
+                    }
+                }
+                self.dialog = Dialog::None;
+            }
+            OpenLogFile => {
+                let p = crate::log::log_path();
+                if p.exists() {
+                    if let Err(e) = open::that_detached(&p) {
+                        self.toast(format!("Não foi possível abrir o log: {e}"));
+                    }
+                } else {
+                    self.toast("Ainda não há arquivo de log");
                 }
             }
             ClearQueue => {

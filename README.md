@@ -55,7 +55,10 @@ ficam em `C:\tabex\session.json`, separadas em cada máquina. Fora desse caso el
 - **Painel de visualização** (Alt+P): imagem, texto (txt, código, csv…), informações do item; miniatura de PDF no Windows.
 - **Arrastar e soltar**: arraste arquivos para pastas da lista, para abas, grupos, janelas e para o painel lateral (move no mesmo disco, copia entre discos; Ctrl copia, Shift move). Solte arquivos vindos do Explorer na lista para copiar (Shift move). No Windows, arraste do Tabex para o Explorer, Outlook e outros programas.
 - Renomear **direto na lista** (F2), seleção por **retângulo** arrastando no vazio, listagem de pastas grandes em segundo plano, atualização instantânea quando a pasta muda (notify).
-- Ao colar sobre nomes existentes, o Tabex pergunta: **Substituir, Pular ou Manter ambos**; operações podem ser **canceladas** e entram numa **fila** (uma por vez).
+- Ao colar sobre nomes existentes, o Tabex pergunta: **Substituir, Pular ou Manter ambos**; operações podem ser **pausadas e canceladas** e entram numa **fila** (uma por vez).
+- Operações grandes mostram **bytes copiados, porcentagem, velocidade e tempo restante**; se um item falhar (sem permissão, em uso, caminho inválido), o Tabex pergunta **Tentar novamente, Pular, Pular todos ou Cancelar** e segue com o resto, com um resumo dos itens pulados no fim.
+- **Unidades**: "Este Computador" mostra rótulo do volume, tipo (local, removível, CD/DVD) e uma barra de uso com o espaço livre na dica; a seção **Rede** lista unidades de rede mapeadas com o caminho UNC (`\\servidor\pasta`), que também pode ser digitado direto na barra de endereços.
+- **Log e travamentos**: erros e operações ficam em `tabex.log` na pasta de configuração (rotação em 2 MB). Se o Tabex fechar inesperadamente, a próxima abertura avisa e oferece abrir o log.
 - Pesquisa **dentro dos arquivos** (menu Filtrar › "Pesquisar dentro dos arquivos" ou prefixo `conteudo:palavra`), limitada a arquivos de texto até 20 MB.
 - **Janelas separadas**: no menu de uma janela, "Abrir em janela separada" cria uma janela real do sistema com aquele espaço de trabalho (para dois monitores, por exemplo); "Trazer de volta" reanexa.
 
@@ -144,7 +147,7 @@ uma tag `v*` publica os zips em uma Release do GitHub.
 
 | Situação | Arquivo |
 |---|---|
-| Windows, instalado em `C:\tabex` (portátil) | `C:\tabex\session.json` |
+| Windows, instalado em `C:\tabex` (portátil) | `C:\tabex\session.json` (e `tabex.log`) |
 | Windows, outros casos | `%APPDATA%\tabex\session.json` |
 | Linux | `~/.config/tabex/session.json` |
 | macOS | `~/Library/Application Support/tabex/session.json` |
@@ -157,8 +160,9 @@ src/
   app.rs             estado do aplicativo, fila de ações e loop de UI
   shortcuts.rs       tabela de atalhos de teclado
   update.rs          verificação/instalação de atualizações (releases do GitHub)
+  log.rs             log em arquivo e captura de pânicos
   model/             sessão persistida: janelas, grupos, abas, cores
-  fs/                listagem, tipos, filtros/consulta, pesquisa recursiva (nome e conteúdo), operações (desfazer, conflitos, fila), nuvem, área de transferência, miniaturas
+  fs/                listagem, tipos, filtros/consulta, pesquisa recursiva (nome e conteúdo), operações (desfazer, conflitos, fila, pausa, erros por item), unidades, nuvem, área de transferência, miniaturas
   platform/          menu de contexto do shell do Windows (IContextMenu) e arrastar para fora (OLE)
   ui/                janelas, abas, barra de ferramentas, painel lateral, lista/grade, visualização, status, diálogos, tema, ícones, arrastar e soltar
 tests/               testes de interface (egui_kittest)

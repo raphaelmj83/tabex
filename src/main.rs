@@ -3,6 +3,7 @@
 use tabex::app;
 
 fn main() -> eframe::Result {
+    tabex::log::init_panic_hook();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
