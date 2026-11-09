@@ -24,7 +24,7 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
         .filter(|c| c.cut)
         .map(|c| c.paths.iter().cloned().collect())
         .unwrap_or_default();
-    let has_clip = app.clipboard.is_some();
+    let has_clip = app.clipboard.is_some() || app.sys_clip_has_files;
     let pinned: Vec<PathBuf> = app.session.pinned.clone();
     let native = app.native_menu_enabled();
     let tab: &mut Tab = &mut app.session.groups[g].tabs[t];

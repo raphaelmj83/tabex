@@ -1,6 +1,7 @@
 use crate::fs::cloud::{self, CloudFolder};
 use crate::fs::entry::{list_drives, FileEntry};
-use crate::fs::ops::{self, Clipboard, OpJob};
+use crate::fs::ops::{self, Clipboard, OpJob, Stack, UndoEntry};
+use crate::fs::sysclip;
 use crate::model::color::GroupColor;
 use crate::model::session::Session;
 use crate::model::tab::{GroupBy, SortKey, Tab};
@@ -94,6 +95,10 @@ pub enum Action {
     Copy,
     Cut,
     Paste,
+    Undo,
+    Redo,
+    PushUndo(UndoEntry),
+    RollbackUpdate,
     PasteInto(PathBuf),
     Delete {
         permanent: bool,
@@ -147,6 +152,12 @@ pub struct TabexApp {
     pub updater: Updater,
     pub hwnd: Option<isize>,
     pub pending_copy_text: Option<String>,
+    pub undo_stack: Vec<UndoEntry>,
+    pub redo_stack: Vec<UndoEntry>,
+    /// Há arquivos na área de transferência do sistema (atualizado uma vez por quadro).
+    pub sys_clip_has_files: bool,
+    /// Sequência da área de transferência quando o Tabex a escreveu pela última vez.
+    clip_seq: Option<u32>,
     drives_at: Instant,
     clouds_at: Instant,
     restart_requested: bool,
@@ -177,6 +188,10 @@ impl TabexApp {
             updater: Updater::new(),
             hwnd: None,
             pending_copy_text: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            sys_clip_has_files: false,
+            clip_seq: None,
             drives_at: Instant::now(),
             clouds_at: Instant::now(),
             restart_requested: false,
@@ -213,21 +228,34 @@ impl TabexApp {
         let mut finished = Vec::new();
         self.ops.retain(|op| {
             if op.is_finished() {
-                finished.push((
-                    op.refresh.clone(),
-                    op.progress.lock().ok().and_then(|p| p.error.clone()),
-                ));
+                let err = op.progress.lock().ok().and_then(|p| p.error.clone());
+                let entry = if err.is_none() { op.undo_entry() } else { None };
+                finished.push((op.refresh.clone(), err, entry, op.push_to));
                 false
             } else {
                 true
             }
         });
-        for (dirs, err) in finished {
+        for (dirs, err, entry, stack) in finished {
             self.refresh_dirs(&dirs);
             if let Some(e) = err {
                 self.error(e);
+            } else if let Some(entry) = entry {
+                match stack {
+                    Stack::Undo => {
+                        self.toast(format!("Concluído: {} (Ctrl+Z desfaz)", entry.label));
+                        self.undo_stack.push(entry);
+                        self.undo_stack.truncate(50);
+                        self.redo_stack.clear();
+                    }
+                    Stack::Redo => {
+                        self.toast(format!("Desfeito: {} (Ctrl+Y refaz)", entry.label));
+                        self.redo_stack.push(entry);
+                    }
+                }
             }
         }
+        self.sys_clip_has_files = sysclip::has_files();
         if !self.ops.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -620,6 +648,18 @@ impl TabexApp {
                 if !paths.is_empty() {
                     let n = paths.len();
                     let cut = matches!(a, Cut);
+                    // Área de transferência do sistema (CF_HDROP no Windows) + cópia interna.
+                    match sysclip::write(&paths, cut) {
+                        Ok(()) => self.clip_seq = sysclip::sequence(),
+                        Err(_) => {
+                            let text = paths
+                                .iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            self.pending_copy_text = Some(text);
+                        }
+                    }
                     self.clipboard = Some(Clipboard { paths, cut });
                     self.toast(format!(
                         "{n} {} {}",
@@ -633,13 +673,53 @@ impl TabexApp {
                 self.apply(PasteInto(dest));
             }
             PasteInto(dest) => {
+                // Se a área de transferência do sistema mudou desde que o Tabex a escreveu
+                // (ex.: copiado no Explorador), ela tem prioridade sobre a cópia interna.
+                let system_newer = self.clipboard.is_none() || sysclip::sequence() != self.clip_seq;
+                if system_newer {
+                    if let Some(sys) = sysclip::read() {
+                        self.clipboard = Some(Clipboard {
+                            paths: sys.paths,
+                            cut: sys.cut,
+                        });
+                        self.clip_seq = sysclip::sequence();
+                    }
+                }
                 if let Some(clip) = self.clipboard.clone() {
                     let job = ops::start_paste(&clip, &dest);
                     self.ops.push(job);
                     if clip.cut {
                         self.clipboard = None;
+                        self.clip_seq = None;
                     }
                 }
+            }
+            Undo => {
+                if !self.ops.is_empty() {
+                    self.toast("Aguarde a operação atual terminar");
+                } else if let Some(entry) = self.undo_stack.pop() {
+                    self.ops.push(ops::start_undo_redo(entry, true));
+                } else {
+                    self.toast("Nada para desfazer");
+                }
+            }
+            Redo => {
+                if !self.ops.is_empty() {
+                    self.toast("Aguarde a operação atual terminar");
+                } else if let Some(entry) = self.redo_stack.pop() {
+                    self.ops.push(ops::start_undo_redo(entry, false));
+                } else {
+                    self.toast("Nada para refazer");
+                }
+            }
+            PushUndo(entry) => {
+                self.undo_stack.push(entry);
+                self.undo_stack.truncate(50);
+                self.redo_stack.clear();
+            }
+            RollbackUpdate => {
+                self.updater.rollback();
+                self.dialog = Dialog::Update;
             }
             Delete { permanent } => {
                 let paths = self.session.active_tab().selected_paths();

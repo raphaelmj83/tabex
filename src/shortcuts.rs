@@ -71,6 +71,10 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Shift+Delete", "Excluir permanentemente"),
             ("F2", "Renomear"),
             ("Ctrl+Shift+N", "Nova pasta"),
+            (
+                "Ctrl+Z / Ctrl+Y",
+                "Desfazer / refazer (mover, copiar, renomear, criar, excluir)",
+            ),
             ("Ctrl+A", "Selecionar tudo"),
             ("Ctrl+Shift+C", "Copiar caminho"),
             ("Alt+Enter", "Propriedades"),
@@ -244,6 +248,12 @@ pub fn collect(ctx: &Context, editing_address: bool) -> Vec<Action> {
         }
         if i.consume_key(CMD, Key::A) {
             out.push(Action::SelectAll);
+        }
+        if i.consume_key(CMD_SHIFT, Key::Z) || i.consume_key(CMD, Key::Y) {
+            out.push(Action::Redo);
+        }
+        if i.consume_key(CMD, Key::Z) {
+            out.push(Action::Undo);
         }
         if i.consume_key(NONE, Key::Escape) {
             out.push(Action::Escape);

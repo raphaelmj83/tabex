@@ -18,6 +18,52 @@ pub struct OpProgress {
     pub current: String,
     pub finished: bool,
     pub error: Option<String>,
+    /// Pares (origem, destino) dos itens de nível superior copiados/movidos.
+    pub pairs: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Uma operação que pode ser desfeita (ou refeita).
+#[derive(Clone, Debug)]
+pub enum UndoKind {
+    Rename { from: PathBuf, to: PathBuf },
+    Move { pairs: Vec<(PathBuf, PathBuf)> },
+    Copy { pairs: Vec<(PathBuf, PathBuf)> },
+    Create { path: PathBuf, is_dir: bool },
+    Trash { paths: Vec<PathBuf> },
+}
+
+#[derive(Clone, Debug)]
+pub struct UndoEntry {
+    pub label: String,
+    pub kind: UndoKind,
+}
+
+impl UndoEntry {
+    pub fn new(label: impl Into<String>, kind: UndoKind) -> UndoEntry {
+        UndoEntry {
+            label: label.into(),
+            kind,
+        }
+    }
+}
+
+/// Em qual pilha a entrada deve entrar quando a operação terminar com sucesso.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stack {
+    Undo,
+    Redo,
+}
+
+/// Como montar a entrada de desfazer ao fim de uma operação.
+#[derive(Clone, Debug)]
+pub enum UndoTemplate {
+    None,
+    /// Mover: pares preenchidos durante a operação.
+    Move,
+    /// Copiar: pares preenchidos durante a operação.
+    Copy,
+    Trash(Vec<PathBuf>),
+    Fixed(UndoEntry),
 }
 
 /// Operação de arquivo em segundo plano (copiar, mover, excluir).
@@ -25,11 +71,59 @@ pub struct OpJob {
     pub progress: Arc<Mutex<OpProgress>>,
     /// Pastas que devem ser recarregadas ao terminar.
     pub refresh: Vec<PathBuf>,
+    pub undo: UndoTemplate,
+    pub push_to: Stack,
 }
 
 impl OpJob {
     pub fn is_finished(&self) -> bool {
         self.progress.lock().map(|p| p.finished).unwrap_or(true)
+    }
+
+    /// Entrada de desfazer/refazer resultante (só faz sentido após terminar sem erro).
+    pub fn undo_entry(&self) -> Option<UndoEntry> {
+        let pairs = self.progress.lock().map(|p| p.pairs.clone()).unwrap_or_default();
+        match &self.undo {
+            UndoTemplate::None => None,
+            UndoTemplate::Move if pairs.is_empty() => None,
+            UndoTemplate::Move => Some(UndoEntry::new(
+                format!("mover {} {}", pairs.len(), plural(pairs.len())),
+                UndoKind::Move { pairs },
+            )),
+            UndoTemplate::Copy if pairs.is_empty() => None,
+            UndoTemplate::Copy => Some(UndoEntry::new(
+                format!("copiar {} {}", pairs.len(), plural(pairs.len())),
+                UndoKind::Copy { pairs },
+            )),
+            UndoTemplate::Trash(paths) => Some(UndoEntry::new(
+                format!("excluir {} {}", paths.len(), plural(paths.len())),
+                UndoKind::Trash { paths: paths.clone() },
+            )),
+            UndoTemplate::Fixed(e) => Some(e.clone()),
+        }
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        "item"
+    } else {
+        "itens"
+    }
+}
+
+fn record_pair(progress: &Arc<Mutex<OpProgress>>, src: &Path, dst: &Path) {
+    if let Ok(mut p) = progress.lock() {
+        p.pairs.push((src.to_path_buf(), dst.to_path_buf()));
+    }
+}
+
+fn finish(progress: &Arc<Mutex<OpProgress>>, result: Result<(), String>) {
+    if let Ok(mut p) = progress.lock() {
+        p.finished = true;
+        if let Err(e) = result {
+            p.error = Some(e);
+        }
     }
 }
 
@@ -176,6 +270,7 @@ pub fn start_paste(clip: &Clipboard, dest: &Path) -> OpJob {
                     }
                     let dst = unique_path(&dest, &name);
                     move_path(src, &dst, &prog)?;
+                    record_pair(&prog, src, &dst);
                 } else {
                     let dst = if same_dir {
                         copy_name(&dest, &name)
@@ -183,18 +278,19 @@ pub fn start_paste(clip: &Clipboard, dest: &Path) -> OpJob {
                         unique_path(&dest, &name)
                     };
                     copy_recursive(src, &dst, &prog)?;
+                    record_pair(&prog, src, &dst);
                 }
             }
             Ok(())
         })();
-        if let Ok(mut p) = prog.lock() {
-            p.finished = true;
-            if let Err(e) = result {
-                p.error = Some(e.to_string());
-            }
-        }
+        finish(&prog, result.map_err(|e| e.to_string()));
     });
-    OpJob { progress, refresh }
+    OpJob {
+        progress,
+        refresh,
+        undo: if cut { UndoTemplate::Move } else { UndoTemplate::Copy },
+        push_to: Stack::Undo,
+    }
 }
 
 /// Exclui itens (lixeira ou permanente).
@@ -209,6 +305,7 @@ pub fn start_delete(paths: Vec<PathBuf>, permanent: bool) -> OpJob {
         ..Default::default()
     }));
     let refresh: Vec<PathBuf> = paths.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
+    let paths_for_undo = paths.clone();
     let prog = progress.clone();
     std::thread::spawn(move || {
         let result = (|| -> Result<(), String> {
@@ -231,14 +328,19 @@ pub fn start_delete(paths: Vec<PathBuf>, permanent: bool) -> OpJob {
             }
             Ok(())
         })();
-        if let Ok(mut p) = prog.lock() {
-            p.finished = true;
-            if let Err(e) = result {
-                p.error = Some(e);
-            }
-        }
+        finish(&prog, result);
     });
-    OpJob { progress, refresh }
+    let undo = if permanent {
+        UndoTemplate::None
+    } else {
+        UndoTemplate::Trash(paths_for_undo)
+    };
+    OpJob {
+        progress,
+        refresh,
+        undo,
+        push_to: Stack::Undo,
+    }
 }
 
 pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
@@ -287,6 +389,159 @@ pub fn create_file(dir: &Path, name: &str) -> io::Result<PathBuf> {
     let p = unique_path(dir, name);
     fs::File::create(&p)?;
     Ok(p)
+}
+
+fn remove_any(p: &Path) -> io::Result<()> {
+    if p.is_dir() {
+        fs::remove_dir_all(p)
+    } else {
+        fs::remove_file(p)
+    }
+}
+
+/// Restaura da Lixeira os itens cujo caminho original está em `paths`.
+fn restore_from_trash(paths: &[PathBuf]) -> Result<(), String> {
+    #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+    {
+        let items = trash::os_limited::list().map_err(|e| format!("Lixeira: {e}"))?;
+        let mut chosen: Vec<trash::TrashItem> = Vec::new();
+        for p in paths {
+            let best = items
+                .iter()
+                .filter(|it| it.original_parent.join(&it.name) == *p)
+                .max_by_key(|it| it.time_deleted)
+                .cloned();
+            match best {
+                Some(it) => chosen.push(it),
+                None => return Err(format!("\"{}\" não foi encontrado na Lixeira.", p.display())),
+            }
+        }
+        trash::os_limited::restore_all(chosen).map_err(|e| format!("Não foi possível restaurar da Lixeira: {e}"))
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        let _ = paths;
+        Err("Restaurar da Lixeira não é suportado neste sistema.".to_owned())
+    }
+}
+
+fn touched_dirs(kind: &UndoKind) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    let mut add = |p: &Path| {
+        if let Some(par) = p.parent() {
+            v.push(par.to_path_buf());
+        }
+    };
+    match kind {
+        UndoKind::Rename { from, to } => {
+            add(from);
+            add(to);
+        }
+        UndoKind::Move { pairs } | UndoKind::Copy { pairs } => {
+            for (a, b) in pairs {
+                add(a);
+                add(b);
+            }
+        }
+        UndoKind::Create { path, .. } => add(path),
+        UndoKind::Trash { paths } => paths.iter().for_each(|p| add(p)),
+    }
+    v
+}
+
+/// Executa o inverso de `entry` (desfazer) ou a própria operação de novo (refazer), em segundo plano.
+/// Ao terminar com sucesso, a mesma entrada vai para a pilha oposta.
+pub fn start_undo_redo(entry: UndoEntry, undo: bool) -> OpJob {
+    let label = format!("{} {}", if undo { "Desfazendo" } else { "Refazendo" }, entry.label);
+    let progress = Arc::new(Mutex::new(OpProgress {
+        label,
+        total: 1,
+        ..Default::default()
+    }));
+    let refresh = touched_dirs(&entry.kind);
+    let prog = progress.clone();
+    let kind = entry.kind.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            match (&kind, undo) {
+                (UndoKind::Rename { from, to }, true) => {
+                    fs::rename(to, from).map_err(|e| format!("Renomear de volta: {e}"))
+                }
+                (UndoKind::Rename { from, to }, false) => fs::rename(from, to).map_err(|e| format!("Renomear: {e}")),
+                (UndoKind::Move { pairs }, _) => {
+                    if let Ok(mut p) = prog.lock() {
+                        p.total = pairs.len().max(1);
+                    }
+                    for (src, dst) in pairs {
+                        let (a, b) = if undo { (dst, src) } else { (src, dst) };
+                        if b.exists() {
+                            return Err(format!(
+                                "\"{}\" já existe; não foi possível mover de volta.",
+                                b.display()
+                            ));
+                        }
+                        move_path(a, b, &prog).map_err(|e| format!("{}: {e}", a.display()))?;
+                    }
+                    Ok(())
+                }
+                (UndoKind::Copy { pairs }, true) => {
+                    for (_, dst) in pairs {
+                        set_current(&prog, dst);
+                        if dst.exists() {
+                            remove_any(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+                        }
+                        tick(&prog);
+                    }
+                    Ok(())
+                }
+                (UndoKind::Copy { pairs }, false) => {
+                    if let Ok(mut p) = prog.lock() {
+                        p.total = count_items(&pairs.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>());
+                    }
+                    for (src, dst) in pairs {
+                        copy_recursive(src, dst, &prog).map_err(|e| format!("{}: {e}", src.display()))?;
+                    }
+                    Ok(())
+                }
+                (UndoKind::Create { path, is_dir }, true) => {
+                    set_current(&prog, path);
+                    if !path.exists() {
+                        return Ok(());
+                    }
+                    let untouched = if *is_dir {
+                        fs::read_dir(path).map(|mut r| r.next().is_none()).unwrap_or(false)
+                    } else {
+                        fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false)
+                    };
+                    if untouched {
+                        remove_any(path).map_err(|e| e.to_string())
+                    } else {
+                        // Já tem conteúdo: vai para a Lixeira em vez de apagar de vez.
+                        trash::delete(path).map_err(|e| e.to_string())
+                    }
+                }
+                (UndoKind::Create { path, is_dir }, false) => {
+                    if *is_dir {
+                        fs::create_dir(path).map_err(|e| e.to_string())
+                    } else {
+                        fs::File::create(path).map(|_| ()).map_err(|e| e.to_string())
+                    }
+                }
+                (UndoKind::Trash { paths }, true) => restore_from_trash(paths),
+                (UndoKind::Trash { paths }, false) => trash::delete_all(paths).map_err(|e| e.to_string()),
+            }
+        })();
+        if let Ok(mut p) = prog.lock() {
+            p.done = p.total;
+        }
+        finish(&prog, result);
+    });
+    OpJob {
+        progress,
+        refresh,
+        undo: UndoTemplate::Fixed(entry),
+        push_to: if undo { Stack::Redo } else { Stack::Undo },
+    }
 }
 
 /// Informações para a janela de propriedades.
@@ -415,6 +670,65 @@ mod tests {
         let job = start_paste(&clip, &folder);
         wait(&job);
         assert!(job.progress.lock().unwrap().error.is_some());
+
+        // desfazer/refazer: mover
+        let moved = dir.join("renomeado - Cópia.txt");
+        let entry = UndoEntry::new(
+            "mover",
+            UndoKind::Move {
+                pairs: vec![(folder.join("renomeado - Cópia.txt"), moved.clone())],
+            },
+        );
+        let job = start_undo_redo(entry.clone(), true);
+        wait(&job);
+        assert!(job.progress.lock().unwrap().error.is_none());
+        assert!(folder.join("renomeado - Cópia.txt").exists() && !moved.exists());
+        assert_eq!(job.push_to, Stack::Redo);
+        let job = start_undo_redo(entry, false);
+        wait(&job);
+        assert!(moved.exists());
+
+        // desfazer renomear e criar
+        let r = UndoEntry::new(
+            "renomear",
+            UndoKind::Rename {
+                from: file.clone(),
+                to: renamed.clone(),
+            },
+        );
+        let job = start_undo_redo(r.clone(), true);
+        wait(&job);
+        assert!(file.exists() && !renamed.exists());
+        let job = start_undo_redo(r, false);
+        wait(&job);
+        assert!(renamed.exists());
+        let created = create_folder(&dir, "Temporaria").unwrap();
+        let job = start_undo_redo(
+            UndoEntry::new(
+                "criar",
+                UndoKind::Create {
+                    path: created.clone(),
+                    is_dir: true,
+                },
+            ),
+            true,
+        );
+        wait(&job);
+        assert!(!created.exists());
+
+        // desfazer copiar remove as cópias
+        let clip = Clipboard {
+            paths: vec![renamed.clone()],
+            cut: false,
+        };
+        let job = start_paste(&clip, &dir);
+        wait(&job);
+        let entry = job.undo_entry().expect("entrada de desfazer");
+        assert!(matches!(entry.kind, UndoKind::Copy { .. }));
+        assert!(dir.join("renomeado.txt").exists());
+        let job = start_undo_redo(entry, true);
+        wait(&job);
+        assert!(!dir.join("renomeado.txt").exists());
 
         // excluir permanentemente
         let job = start_delete(vec![again.clone()], true);

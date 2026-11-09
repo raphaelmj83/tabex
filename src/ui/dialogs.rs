@@ -94,6 +94,15 @@ pub fn show(ctx: &Context, app: &mut TabexApp) {
                         if let Some(p) = parent {
                             actions.push(Action::Navigate(p));
                         }
+                        if new_path != path {
+                            actions.push(Action::PushUndo(ops::UndoEntry::new(
+                                "renomear",
+                                ops::UndoKind::Rename {
+                                    from: path.clone(),
+                                    to: new_path.clone(),
+                                },
+                            )));
+                        }
                         actions.push(Action::Toast(format!(
                             "Renomeado para \"{}\"",
                             new_path
@@ -111,7 +120,13 @@ pub fn show(ctx: &Context, app: &mut TabexApp) {
             let dir = dir.clone();
             text_dialog(ctx, "Nova pasta", "Nome da pasta:", name, first, false, |name| {
                 ops::create_folder(&dir, name)
-                    .map(|_| actions.push(Action::Refresh))
+                    .map(|p| {
+                        actions.push(Action::PushUndo(ops::UndoEntry::new(
+                            "criar pasta",
+                            ops::UndoKind::Create { path: p, is_dir: true },
+                        )));
+                        actions.push(Action::Refresh)
+                    })
                     .map_err(|e| e.to_string())
             })
         }
@@ -126,7 +141,13 @@ pub fn show(ctx: &Context, app: &mut TabexApp) {
                 true,
                 |name| {
                     ops::create_file(&dir, name)
-                        .map(|_| actions.push(Action::Refresh))
+                        .map(|p| {
+                            actions.push(Action::PushUndo(ops::UndoEntry::new(
+                                "criar arquivo",
+                                ops::UndoKind::Create { path: p, is_dir: false },
+                            )));
+                            actions.push(Action::Refresh)
+                        })
                         .map_err(|e| e.to_string())
                 },
             )
@@ -505,6 +526,11 @@ fn update_dialog(ctx: &Context, app: &mut TabexApp, actions: &mut Vec<Action>) -
                     RichText::new(format!("✔ Versão {} instalada.", info.tag)).color(ui.visuals().hyperlink_color),
                 );
                 ui.label("Reinicie o Tabex para usar a nova versão. Suas janelas, grupos e abas são mantidos.");
+                ui.weak("A versão anterior ficou guardada como backup (.bak) ao lado do executável.");
+            }
+            UpdateState::RolledBack => {
+                ui.label(RichText::new("✔ Versão anterior restaurada.").color(ui.visuals().hyperlink_color));
+                ui.label("Reinicie o Tabex para concluir.");
             }
             UpdateState::Error(e) => {
                 ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
@@ -540,7 +566,7 @@ fn update_dialog(ctx: &Context, app: &mut TabexApp, actions: &mut Vec<Action>) -
                         let _ = open::that_detached(&info.html_url);
                     }
                 }
-                UpdateState::Installed(_) => {
+                UpdateState::Installed(_) | UpdateState::RolledBack => {
                     if ui.button(RichText::new("🔄 Reiniciar agora").strong()).clicked() {
                         actions.push(Action::RestartApp);
                     }
@@ -549,6 +575,14 @@ fn update_dialog(ctx: &Context, app: &mut TabexApp, actions: &mut Vec<Action>) -
                 _ => {
                     if ui.button("Verificar agora").clicked() {
                         actions.push(Action::CheckUpdates { manual: true });
+                    }
+                    if Updater::has_backup()
+                        && ui
+                            .button("↩ Restaurar versão anterior")
+                            .on_hover_text("Volta para o executável guardado em .bak")
+                            .clicked()
+                    {
+                        actions.push(Action::RollbackUpdate);
                     }
                 }
             }

@@ -79,6 +79,8 @@ jobs:
             n="${d%/}"
             (cd "$n" && zip -r "../$n-$TAG.zip" .)
           done
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
           ls -la
       - uses: softprops/action-gh-release@v2
         with:
@@ -86,4 +88,6 @@ jobs:
           name: Tabex ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt

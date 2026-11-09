@@ -1,6 +1,6 @@
 [package]
 name = "tabex"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Gerenciador de arquivos com abas e grupos de abas coloridos, inspirado no Explorador de Arquivos do Windows"
 license = "MIT"
@@ -24,10 +24,12 @@ humansize = "2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 self-replace = "1"
 semver = "1"
+sha2 = "0.11"
 raw-window-handle = "0.6"
 
 # HTTP para o atualizador: TLS nativo (Schannel) no Windows, rustls nos demais.
 [target.'cfg(windows)'.dependencies]
+clipboard-win = "5"
 ureq = { version = "3", default-features = false, features = ["native-tls", "gzip"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",

@@ -17,7 +17,9 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
 fn command_bar(ui: &mut Ui, app: &mut TabexApp, actions: &mut Vec<Action>) {
     let tab = app.session.active_tab();
     let has_sel = !tab.selected.is_empty();
-    let has_clip = app.clipboard.is_some();
+    let has_clip = app.clipboard.is_some() || app.sys_clip_has_files;
+    let undo_label = app.undo_stack.last().map(|e| format!("Desfazer {}", e.label));
+    let redo_label = app.redo_stack.last().map(|e| format!("Refazer {}", e.label));
     let sort_key = tab.sort_key;
     let sort_asc = tab.sort_asc;
     let group_by = tab.group_by;
@@ -62,6 +64,27 @@ fn command_bar(ui: &mut Ui, app: &mut TabexApp, actions: &mut Vec<Action>) {
         }
         if cmd(ui, "🗑", "Excluir", "Delete", has_sel) {
             actions.push(Action::Delete { permanent: false });
+        }
+        ui.separator();
+        if ui
+            .add_enabled(undo_label.is_some(), Button::new("↶").frame(false))
+            .on_hover_text(format!(
+                "{} (Ctrl+Z)",
+                undo_label.clone().unwrap_or_else(|| "Desfazer".into())
+            ))
+            .clicked()
+        {
+            actions.push(Action::Undo);
+        }
+        if ui
+            .add_enabled(redo_label.is_some(), Button::new("↷").frame(false))
+            .on_hover_text(format!(
+                "{} (Ctrl+Y)",
+                redo_label.clone().unwrap_or_else(|| "Refazer".into())
+            ))
+            .clicked()
+        {
+            actions.push(Action::Redo);
         }
         ui.separator();
 

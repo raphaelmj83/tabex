@@ -16,6 +16,8 @@ pub struct ReleaseInfo {
     pub asset_name: Option<String>,
     /// URL da API do asset (funciona em repositórios privados com token).
     pub asset_url: Option<String>,
+    /// URL do arquivo SHA256SUMS.txt da release, se publicado.
+    pub sums_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,6 +28,8 @@ pub enum UpdateState {
     Available(ReleaseInfo),
     Downloading(ReleaseInfo),
     Installed(ReleaseInfo),
+    /// Versão anterior restaurada a partir do backup; precisa reiniciar.
+    RolledBack,
     Error(String),
 }
 
@@ -74,6 +78,37 @@ impl Updater {
 
     pub fn token_path() -> std::path::PathBuf {
         Session::config_dir().join("github_token.txt")
+    }
+
+    /// Caminho do backup do executável anterior (`tabex.exe.bak`).
+    pub fn backup_path() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let mut name = exe.file_name()?.to_os_string();
+        name.push(".bak");
+        Some(exe.with_file_name(name))
+    }
+
+    pub fn has_backup() -> bool {
+        Self::backup_path().map(|p| p.is_file()).unwrap_or(false)
+    }
+
+    /// Volta para o executável anterior guardado em `tabex.exe.bak`.
+    pub fn rollback(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+        let result = (|| -> Result<(), String> {
+            let bak = Self::backup_path().ok_or("Sem backup.")?;
+            if !bak.is_file() {
+                return Err("Não há backup da versão anterior.".to_owned());
+            }
+            let bytes = std::fs::read(&bak).map_err(|e| e.to_string())?;
+            install_bytes(&bytes, false)
+        })();
+        *self.state.lock().unwrap() = match result {
+            Ok(()) => UpdateState::RolledBack,
+            Err(e) => UpdateState::Error(e),
+        };
     }
 
     pub fn check(&mut self) {
@@ -185,13 +220,16 @@ pub fn parse_release(json: &str) -> Result<ReleaseInfo, String> {
     let suffix = asset_suffix();
     let mut asset_name = None;
     let mut asset_url = None;
+    let mut sums_url = None;
     if let Some(assets) = v.get("assets").and_then(|a| a.as_array()) {
         for a in assets {
             let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name.contains(suffix) && name.ends_with(".zip") {
+            let url = a.get("url").and_then(|u| u.as_str()).map(str::to_owned);
+            if name.eq_ignore_ascii_case("SHA256SUMS.txt") {
+                sums_url = url;
+            } else if asset_name.is_none() && name.contains(suffix) && name.ends_with(".zip") {
                 asset_name = Some(name.to_owned());
-                asset_url = a.get("url").and_then(|u| u.as_str()).map(str::to_owned);
-                break;
+                asset_url = url;
             }
         }
     }
@@ -202,6 +240,40 @@ pub fn parse_release(json: &str) -> Result<ReleaseInfo, String> {
         html_url: v.get("html_url").and_then(|u| u.as_str()).unwrap_or("").to_owned(),
         asset_name,
         asset_url,
+        sums_url,
+    })
+}
+
+fn download(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut req = ureq::get(url)
+        .header("User-Agent", user_agent())
+        .header("Accept", "application/octet-stream")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let mut resp = req.call().map_err(friendly)?;
+    resp.body_mut()
+        .with_config()
+        .limit(512 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| format!("Falha ao baixar: {e}"))
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Procura o hash de `name` num SHA256SUMS.txt ("<hex>  <nome>" por linha).
+pub fn find_sum(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut it = line.split_whitespace();
+        let hash = it.next()?;
+        let file = it.next()?.trim_start_matches('*');
+        let file = file.rsplit('/').next().unwrap_or(file);
+        (file == name && hash.len() == 64).then(|| hash.to_ascii_lowercase())
     })
 }
 
@@ -213,22 +285,26 @@ fn download_and_install(info: &ReleaseInfo, token: Option<&str>) -> Result<(), S
             asset_suffix()
         )
     })?;
-    let mut req = ureq::get(url)
-        .header("User-Agent", user_agent())
-        .header("Accept", "application/octet-stream")
-        .header("X-GitHub-Api-Version", "2022-11-28");
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {t}"));
+    let bytes = download(url, token)?;
+
+    // Integridade: confere o SHA-256 publicado na release (obrigatório quando o arquivo existe).
+    if let (Some(sums_url), Some(name)) = (info.sums_url.as_deref(), info.asset_name.as_deref()) {
+        let sums = String::from_utf8_lossy(&download(sums_url, token)?).into_owned();
+        let expected = find_sum(&sums, name).ok_or_else(|| {
+            format!("SHA256SUMS.txt da release não lista {name}; instalação cancelada por segurança.")
+        })?;
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
+            return Err(format!(
+                "O pacote baixado não confere com o hash publicado (esperado {}…, obtido {}…). Instalação cancelada.",
+                &expected[..12],
+                &actual[..12]
+            ));
+        }
     }
-    let mut resp = req.call().map_err(friendly)?;
-    let bytes = resp
-        .body_mut()
-        .with_config()
-        .limit(512 * 1024 * 1024)
-        .read_to_vec()
-        .map_err(|e| format!("Falha ao baixar: {e}"))?;
+
     let exe_bytes = extract_executable(&bytes)?;
-    install_bytes(&exe_bytes)
+    install_bytes(&exe_bytes, true)
 }
 
 /// Extrai `tabex.exe`/`tabex` do zip da release.
@@ -252,8 +328,13 @@ pub fn extract_executable(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn install_bytes(exe_bytes: &[u8]) -> Result<(), String> {
+fn install_bytes(exe_bytes: &[u8], keep_backup: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if keep_backup {
+        if let Some(bak) = Updater::backup_path() {
+            std::fs::copy(&exe, &bak).map_err(|e| format!("Não foi possível criar o backup {}: {e}", bak.display()))?;
+        }
+    }
     let tmp = exe.with_extension("new");
     std::fs::write(&tmp, exe_bytes).map_err(|e| format!("Não foi possível gravar {}: {e}", tmp.display()))?;
     #[cfg(unix)]
@@ -293,6 +374,7 @@ mod tests {
         let json = format!(
             r#"{{"tag_name":"v9.9.9","html_url":"https://github.com/x/y/releases/tag/v9.9.9","body":"notas",
             "assets":[{{"name":"tabex-{}-v9.9.9.zip","url":"https://api.github.com/repos/x/y/releases/assets/1"}},
+                      {{"name":"SHA256SUMS.txt","url":"https://api.github.com/repos/x/y/releases/assets/3"}},
                       {{"name":"outro.zip","url":"https://api.github.com/repos/x/y/releases/assets/2"}}]}}"#,
             asset_suffix()
         );
@@ -304,6 +386,25 @@ mod tests {
             Some("https://api.github.com/repos/x/y/releases/assets/1")
         );
         assert!(parse_release("{}").is_err());
+    }
+
+    #[test]
+    fn sha256_and_sums_parsing() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let sums = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD  tabex-windows-x64-v1.zip\n\
+                    0000000000000000000000000000000000000000000000000000000000000000 *dist/outro.zip\n";
+        assert_eq!(
+            find_sum(sums, "tabex-windows-x64-v1.zip").as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            find_sum(sums, "outro.zip").as_deref(),
+            Some("0000000000000000000000000000000000000000000000000000000000000000")
+        );
+        assert!(find_sum(sums, "nada.zip").is_none());
     }
 
     #[test]

@@ -23,7 +23,9 @@ todos com nome e cor, para organizar tudo o que você tem aberto.
    baixa e instala a nova versão sozinho (o próprio executável se substitui e pede para reiniciar).
 
 O Tabex também verifica novas versões sozinho ao iniciar, uma vez por dia; quando há uma, aparece um aviso
-"⬆ Atualizar para vX" na barra de status.
+"⬆ Atualizar para vX" na barra de status. Antes de instalar, o pacote baixado é conferido contra o
+`SHA256SUMS.txt` publicado na release (se não bater, nada é alterado), e o executável anterior fica guardado
+como `tabex.exe.bak`; o diálogo de atualizações tem "Restaurar versão anterior" caso algo dê errado.
 
 > **Repositório privado?** Salve um token do GitHub com permissão de leitura de releases em
 > `C:\tabex\github_token.txt` (ou na variável de ambiente `TABEX_GITHUB_TOKEN`). O instalador e o
@@ -71,6 +73,8 @@ ficam em `C:\tabex\session.json`, separadas em cada máquina. Fora desse caso el
 
 **Operações de arquivo**
 - Recortar, copiar, colar (cópia na mesma pasta gera "Nome - Cópia"), renomear (F2, seleciona o nome sem a extensão), nova pasta, novo documento de texto.
+- **Desfazer / refazer (Ctrl+Z / Ctrl+Y)** para mover, copiar, renomear, criar e excluir para a Lixeira (restaura da Lixeira). Os botões ↶ ↷ da barra mostram o que será desfeito.
+- **Área de transferência integrada ao Windows**: copie no Tabex e cole no Explorer (ou no Outlook), copie no Explorer e cole no Tabex; recortar é respeitado nos dois sentidos (CF_HDROP + Preferred DropEffect).
 - Excluir para a **Lixeira** (Delete) ou permanentemente (Shift+Delete), com confirmação.
 - Operações longas rodam em segundo plano com barra de progresso na barra de status.
 - Abrir com o aplicativo padrão (Enter / duplo clique), copiar caminho, fixar no Acesso rápido, Propriedades (tamanho de pastas calculado em segundo plano).
@@ -94,6 +98,7 @@ ficam em `C:\tabex\session.json`, separadas em cada máquina. Fora desse caso el
 | Ctrl+L, Alt+D, F4 | Barra de endereços |
 | Ctrl+E, Ctrl+F, F3 | Pesquisa |
 | Ctrl+C / X / V, Delete, Shift+Delete, F2 | Copiar / recortar / colar, excluir, renomear |
+| Ctrl+Z / Ctrl+Y | Desfazer / refazer |
 | Ctrl+Shift+N | Nova pasta |
 | Ctrl+Shift+C | Copiar caminho |
 | Ctrl+D | Fixar / desafixar pasta atual |
@@ -143,7 +148,7 @@ src/
   shortcuts.rs       tabela de atalhos de teclado
   update.rs          verificação/instalação de atualizações (releases do GitHub)
   model/             sessão persistida: janelas, grupos, abas, cores
-  fs/                listagem, tipos, filtros/consulta, pesquisa recursiva, operações, nuvem
+  fs/                listagem, tipos, filtros/consulta, pesquisa recursiva, operações (com desfazer), nuvem, área de transferência
   platform/          menu de contexto do shell do Windows (IContextMenu)
   ui/                janelas, abas, barra de ferramentas, painel lateral, lista, status, diálogos, tema, ícones
 installer/           instalar.bat / atualizar.bat (C:\tabex)
@@ -155,7 +160,6 @@ assets/              ícone (pasta azul) e gerador
 - Janelas como janelas reais do sistema (viewports), além dos espaços de trabalho
 - Visualizações em ícones grandes/miniaturas
 - Painel de visualização (preview) de imagens e texto
-- Desfazer (Ctrl+Z) para mover/renomear
 - Arrastar e soltar arquivos entre abas
 - Ícones nativos do sistema para tipos de arquivo
 
