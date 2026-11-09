@@ -32,9 +32,31 @@ pub fn paint(painter: &Painter, rect: Rect, kind: FileKind, dark: bool) {
 }
 
 /// Aloca espaço e desenha o ícone, sem interação.
+#[allow(dead_code)]
 pub fn show(ui: &mut Ui, kind: FileKind, size: f32, dark: bool) {
     let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
     paint(ui.painter(), rect, kind, dark);
+}
+
+/// Ícone de uma entrada: o do sistema (Windows), se disponível, senão o desenhado.
+pub fn entry(
+    ui: &mut Ui,
+    e: &crate::fs::entry::FileEntry,
+    size: f32,
+    dark: bool,
+    thumbs: Option<&crate::fs::thumbs::ThumbService>,
+) {
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    if let Some(tex) = thumbs.and_then(|t| t.icon(e, 16)) {
+        ui.painter().image(
+            tex.id(),
+            rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        paint(ui.painter(), rect, e.kind, dark);
+    }
 }
 
 pub fn folder(painter: &Painter, rect: Rect) {

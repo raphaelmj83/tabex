@@ -31,6 +31,11 @@ pub enum Dialog {
         paths: Vec<PathBuf>,
         permanent: bool,
     },
+    Conflict {
+        clip: ops::Clipboard,
+        dest: PathBuf,
+        conflicts: Vec<ops::Conflict>,
+    },
     Group {
         index: Option<usize>,
         name: String,
@@ -152,7 +157,8 @@ pub fn show(ctx: &Context, app: &mut TabexApp) {
                 },
             )
         }
-        Dialog::ConfirmDelete { paths, permanent } => confirm_delete(ctx, app, paths, *permanent),
+        Dialog::ConfirmDelete { paths, permanent } => confirm_delete(ctx, paths, *permanent, &mut actions),
+        Dialog::Conflict { clip, dest, conflicts } => conflict_dialog(ctx, clip, dest, conflicts, &mut actions),
         Dialog::Group {
             index,
             name,
@@ -255,7 +261,7 @@ pub fn show(ctx: &Context, app: &mut TabexApp) {
 }
 
 /// Seleciona o nome sem a extensão (como o Explorador faz ao renomear).
-fn select_stem(ctx: &Context, id: Id, text: &str, keep_ext: bool) {
+pub fn select_stem(ctx: &Context, id: Id, text: &str, keep_ext: bool) {
     if let Some(mut state) = TextEdit::load_state(ctx, id) {
         let end = if keep_ext {
             match text.rfind('.') {
@@ -338,7 +344,7 @@ fn text_dialog(
     result
 }
 
-fn confirm_delete(ctx: &Context, app: &mut TabexApp, paths: &[PathBuf], permanent: bool) -> Outcome {
+fn confirm_delete(ctx: &Context, paths: &[PathBuf], permanent: bool, actions: &mut Vec<Action>) -> Outcome {
     let n = paths.len();
     let what = if n == 1 {
         format!(
@@ -383,7 +389,10 @@ fn confirm_delete(ctx: &Context, app: &mut TabexApp, paths: &[PathBuf], permanen
             let yes = ui.button("Sim").clicked() || ui.input(|i| i.key_pressed(Key::Enter));
             let no = ui.button("Não").clicked();
             if yes {
-                app.ops.push(ops::start_delete(paths.to_vec(), permanent));
+                actions.push(Action::Enqueue(ops::QueuedOp::Delete {
+                    paths: paths.to_vec(),
+                    permanent,
+                }));
                 result = Outcome::Close;
             } else if no {
                 result = Outcome::Close;
@@ -593,6 +602,99 @@ fn update_dialog(ctx: &Context, app: &mut TabexApp, actions: &mut Vec<Action>) -
     } else {
         Outcome::Keep
     }
+}
+
+fn conflict_dialog(
+    ctx: &Context,
+    clip: &ops::Clipboard,
+    dest: &std::path::Path,
+    conflicts: &[ops::Conflict],
+    actions: &mut Vec<Action>,
+) -> Outcome {
+    use crate::fs::entry::{format_date, format_size_human};
+    let mut result = Outcome::Keep;
+    let n = conflicts.len();
+    let m = Modal::new(Id::unique("dlg_conflict")).show(ctx, |ui| {
+        ui.set_width(560.0);
+        ui.heading(if n == 1 {
+            "O destino já tem um item com este nome".to_owned()
+        } else {
+            format!("O destino já tem {n} itens com os mesmos nomes")
+        });
+        ui.add_space(4.0);
+        ui.weak(format!("Destino: {}", dest.display()));
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            Grid::new("conflicts")
+                .num_columns(3)
+                .striped(true)
+                .spacing(vec2(14.0, 4.0))
+                .show(ui, |ui| {
+                    ui.strong("Nome");
+                    ui.strong("Origem");
+                    ui.strong("Já existe no destino");
+                    ui.end_row();
+                    for c in conflicts.iter().take(200) {
+                        let info = |p: &std::path::Path| {
+                            std::fs::metadata(p)
+                                .map(|m| {
+                                    if m.is_dir() {
+                                        format!("pasta · {}", format_date(m.modified().ok()))
+                                    } else {
+                                        format!("{} · {}", format_size_human(m.len()), format_date(m.modified().ok()))
+                                    }
+                                })
+                                .unwrap_or_default()
+                        };
+                        ui.add(egui::Label::new(&c.name).truncate());
+                        ui.label(RichText::new(info(&c.src)).small());
+                        ui.label(RichText::new(info(&c.dst)).small());
+                        ui.end_row();
+                    }
+                });
+        });
+        ui.add_space(10.0);
+        ui.label("O que fazer com os itens em conflito? (os demais são copiados normalmente)");
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            let mut pick = |policy: ops::ConflictPolicy| {
+                actions.push(Action::PasteWith {
+                    clip: clip.clone(),
+                    dest: dest.to_path_buf(),
+                    policy,
+                });
+                result = Outcome::Close;
+            };
+            if ui
+                .add(Button::new(RichText::new("Substituir").strong()))
+                .on_hover_text("Sobrescreve os arquivos existentes; pastas são mescladas. Não pode ser desfeito.")
+                .clicked()
+            {
+                pick(ops::ConflictPolicy::Replace);
+            }
+            if ui
+                .button("Pular")
+                .on_hover_text("Mantém os existentes e não copia os itens em conflito")
+                .clicked()
+            {
+                pick(ops::ConflictPolicy::Skip);
+            }
+            if ui
+                .button("Manter ambos")
+                .on_hover_text("Copia com outro nome: \"Nome (2)\"")
+                .clicked()
+            {
+                pick(ops::ConflictPolicy::KeepBoth);
+            }
+            if ui.button("Cancelar").clicked() {
+                result = Outcome::Close;
+            }
+        });
+    });
+    if m.should_close() {
+        return Outcome::Close;
+    }
+    result
 }
 
 fn properties(

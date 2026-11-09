@@ -1,6 +1,9 @@
 pub mod dialogs;
+pub mod dnd;
 pub mod filelist;
+pub mod gridview;
 pub mod icons;
+pub mod preview;
 pub mod sidebar;
 pub mod statusbar;
 pub mod tabstrip;

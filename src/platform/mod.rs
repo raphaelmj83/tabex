@@ -3,7 +3,26 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
+pub mod drag_out;
+#[cfg(windows)]
 pub mod shell_menu;
+
+/// Arrastar arquivos para fora do Tabex (Windows). Bloqueia até soltar; `Ok(true)` se moveu.
+pub fn drag_out(paths: &[PathBuf]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        drag_out::drag_out(paths).map(|o| o == drag_out::DragOutcome::Moved)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = paths;
+        Err("Arrastar para outros programas só está disponível no Windows.".to_owned())
+    }
+}
+
+pub fn drag_out_supported() -> bool {
+    cfg!(windows)
+}
 
 /// Item extra do Tabex inserido no topo do menu nativo.
 #[cfg_attr(not(windows), allow(dead_code))]

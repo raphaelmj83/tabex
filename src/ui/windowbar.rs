@@ -6,6 +6,35 @@ use egui::{vec2, Align2, Button, Color32, CornerRadius, FontId, Rect, RichText, 
 
 pub const HEIGHT: f32 = 30.0;
 
+/// Cabeçalho de uma janela separada: nome, cor e botão para trazer de volta.
+pub fn show_detached_header(ui: &mut Ui, app: &mut TabexApp) {
+    let mut actions: Vec<Action> = Vec::new();
+    let w = app.session.active_workspace();
+    let (id, name, color) = (w.id, w.name.clone(), w.color.color());
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 6.0, color);
+        ui.label(RichText::new(&name).strong());
+        ui.label(RichText::new("janela separada").small().weak());
+        if ui
+            .add(Button::new(RichText::new("⤶ Trazer de volta").small()))
+            .on_hover_text("Volta para a janela principal do Tabex")
+            .clicked()
+        {
+            actions.push(Action::AttachWindow(id));
+        }
+        if ui
+            .add(Button::new(RichText::new("✏").small()).frame(false))
+            .on_hover_text("Renomear / cor")
+            .clicked()
+        {
+            let wi = app.session.active_window;
+            actions.push(Action::EditWindow(wi));
+        }
+    });
+    app.pending.extend(actions);
+}
+
 pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     let mut actions: Vec<Action> = Vec::new();
     let aw = app.session.active_window;
@@ -53,7 +82,11 @@ fn draw_chip(ui: &mut Ui, app: &TabexApp, wi: usize, active: bool, n: usize, act
     let color = w.color.color();
     let groups = app.session.window_group_count(wi);
     let tabs = app.session.window_tab_count(wi);
-    let text = w.name.clone();
+    let text = if w.detached {
+        format!("{} ⧉", w.name)
+    } else {
+        w.name.clone()
+    };
     let font = FontId::proportional(13.0);
     let galley = ui
         .painter()
@@ -106,6 +139,18 @@ fn draw_chip(ui: &mut Ui, app: &TabexApp, wi: usize, active: bool, n: usize, act
             actions.push(Action::MoveTabToWindow { g: p.g, t: p.t, w: wi });
         }
     }
+    // Soltar arquivos numa janela = colar na pasta da aba ativa dela.
+    let dest = if active {
+        Some(app.session.active_tab().path.clone())
+    } else {
+        w.groups
+            .get(w.active_group)
+            .and_then(|g| g.tabs.get(g.active))
+            .map(|t| t.path.clone())
+    };
+    if let Some(dest) = dest {
+        crate::ui::dnd::drop_target(ui, &resp, &dest, actions);
+    }
 
     if resp.double_clicked() {
         actions.push(Action::EditWindow(wi));
@@ -117,7 +162,8 @@ fn draw_chip(ui: &mut Ui, app: &TabexApp, wi: usize, active: bool, n: usize, act
     }
 
     let resp = resp.on_hover_text(format!(
-        "{}\n{groups} {} · {tabs} {}\nDuplo clique: renomear / cor",
+        "{}{}\n{groups} {} · {tabs} {}\nDuplo clique: renomear / cor",
+        if w.detached { "(janela separada) " } else { "" },
         w.name,
         if groups == 1 { "grupo" } else { "grupos" },
         if tabs == 1 { "aba" } else { "abas" }

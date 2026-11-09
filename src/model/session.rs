@@ -27,6 +27,12 @@ pub struct Session {
     pub auto_update: bool,
     /// Época (segundos) da última verificação de atualização.
     pub last_update_check: u64,
+    /// Visualização em ícones grandes (em vez de detalhes).
+    pub view_icons: bool,
+    /// Painel de visualização à direita.
+    pub preview_visible: bool,
+    /// Pesquisa recursiva também dentro do conteúdo dos arquivos.
+    pub search_content: bool,
 }
 
 /// Formato gravado em disco (versão 2: com janelas).
@@ -45,6 +51,9 @@ struct SessionFileRef<'a> {
     use_native_menu: bool,
     auto_update: bool,
     last_update_check: u64,
+    view_icons: bool,
+    preview_visible: bool,
+    search_content: bool,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +87,12 @@ struct SessionFile {
     auto_update: bool,
     #[serde(default)]
     last_update_check: u64,
+    #[serde(default)]
+    view_icons: bool,
+    #[serde(default)]
+    preview_visible: bool,
+    #[serde(default)]
+    search_content: bool,
 }
 
 fn yes() -> bool {
@@ -157,6 +172,9 @@ impl Session {
             use_native_menu: f.use_native_menu,
             auto_update: f.auto_update,
             last_update_check: f.last_update_check,
+            view_icons: f.view_icons,
+            preview_visible: f.preview_visible,
+            search_content: f.search_content,
         };
         if s.active_window >= s.windows.len() {
             s.active_window = 0;
@@ -188,6 +206,9 @@ impl Session {
             use_native_menu: self.use_native_menu,
             auto_update: self.auto_update,
             last_update_check: self.last_update_check,
+            view_icons: self.view_icons,
+            preview_visible: self.preview_visible,
+            search_content: self.search_content,
         };
         let json = serde_json::to_string_pretty(&file).map_err(std::io::Error::other);
         self.unstash_active();
@@ -227,6 +248,9 @@ impl Session {
             use_native_menu: cfg!(windows),
             auto_update: true,
             last_update_check: 0,
+            view_icons: false,
+            preview_visible: false,
+            search_content: false,
         };
         let wid = s.alloc_id();
         s.windows.push(Workspace::new(wid, "Principal", GroupColor::Blue));
@@ -861,6 +885,9 @@ mod tests {
             use_native_menu: true,
             auto_update: true,
             last_update_check: 0,
+            view_icons: false,
+            preview_visible: false,
+            search_content: false,
         })
         .unwrap();
         s.unstash_active();

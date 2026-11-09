@@ -56,6 +56,13 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Enter na pesquisa", "Pesquisar em subpastas"),
             ("Esc", "Limpar pesquisa / filtros / seleção"),
             ("Ctrl+B", "Mostrar/ocultar painel de navegação"),
+            ("Alt+P", "Painel de visualização"),
+            ("Ctrl+Shift+2 / Ctrl+Shift+6", "Ícones grandes / Detalhes"),
+            ("Arrastar no vazio", "Selecionar por retângulo"),
+            (
+                "Arrastar arquivos",
+                "Mover (mesmo disco) / copiar; Ctrl copia, Shift move",
+            ),
             ("Ctrl+H", "Mostrar/ocultar itens ocultos"),
             ("Ctrl+D", "Fixar / desafixar pasta atual"),
             ("Digitar letras", "Pular para o item que começa com elas"),
@@ -93,6 +100,41 @@ pub fn collect(ctx: &Context, editing_address: bool) -> Vec<Action> {
 
     ctx.input_mut(|i| {
         // ---- globais (funcionam mesmo com um campo de texto em foco) ----
+        // Padrões com mais modificadores vêm primeiro: `consume_key(CMD, T)` também casa com
+        // Ctrl+Alt+T (o Alt extra é ignorado), então Ctrl+Alt+T precisa ser testado antes.
+        if i.consume_key(CMD_ALT, Key::T) {
+            out.push(Action::NewWindow);
+        }
+        if i.consume_key(CMD_ALT, Key::W) {
+            out.push(Action::CloseActiveWindow);
+        }
+        if i.consume_key(CMD_ALT, Key::G) {
+            out.push(Action::EditActiveWindow);
+        }
+        if i.consume_key(CMD_ALT, Key::PageDown) {
+            out.push(Action::CycleWindow(1));
+        }
+        if i.consume_key(CMD_ALT, Key::PageUp) {
+            out.push(Action::CycleWindow(-1));
+        }
+        for (n, k) in [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ]
+        .iter()
+        .enumerate()
+        {
+            if i.consume_key(CMD_ALT, *k) {
+                out.push(Action::SwitchWindow(n));
+            }
+        }
         if i.consume_key(CMD_SHIFT, Key::T) {
             out.push(Action::ReopenClosedTab);
         }
@@ -138,39 +180,6 @@ pub fn collect(ctx: &Context, editing_address: bool) -> Vec<Action> {
         if i.consume_key(CMD, Key::G) {
             out.push(Action::NewGroup);
         }
-        if i.consume_key(CMD_ALT, Key::T) {
-            out.push(Action::NewWindow);
-        }
-        if i.consume_key(CMD_ALT, Key::W) {
-            out.push(Action::CloseActiveWindow);
-        }
-        if i.consume_key(CMD_ALT, Key::G) {
-            out.push(Action::EditActiveWindow);
-        }
-        if i.consume_key(CMD_ALT, Key::PageDown) {
-            out.push(Action::CycleWindow(1));
-        }
-        if i.consume_key(CMD_ALT, Key::PageUp) {
-            out.push(Action::CycleWindow(-1));
-        }
-        for (n, k) in [
-            Key::Num1,
-            Key::Num2,
-            Key::Num3,
-            Key::Num4,
-            Key::Num5,
-            Key::Num6,
-            Key::Num7,
-            Key::Num8,
-            Key::Num9,
-        ]
-        .iter()
-        .enumerate()
-        {
-            if i.consume_key(CMD_ALT, *k) {
-                out.push(Action::SwitchWindow(n));
-            }
-        }
         if i.consume_key(CMD_ALT, Key::ArrowRight) {
             out.push(Action::CycleGroup(1));
         }
@@ -204,6 +213,15 @@ pub fn collect(ctx: &Context, editing_address: bool) -> Vec<Action> {
         }
         if i.consume_key(CMD, Key::B) {
             out.push(Action::ToggleSidebar);
+        }
+        if i.consume_key(ALT, Key::P) {
+            out.push(Action::TogglePreview);
+        }
+        if i.consume_key(CMD_SHIFT, Key::Num2) {
+            out.push(Action::SetViewIcons(true));
+        }
+        if i.consume_key(CMD_SHIFT, Key::Num6) {
+            out.push(Action::SetViewIcons(false));
         }
         if i.consume_key(CMD_SHIFT, Key::C) {
             out.push(Action::CopyPath);

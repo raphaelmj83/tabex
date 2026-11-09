@@ -95,6 +95,23 @@ pub struct Tab {
     pub type_ahead_at: Option<Instant>,
     #[serde(skip)]
     pub loaded_hidden: bool,
+    /// Listagem em andamento (geração, receptor). A geração descarta resultados obsoletos.
+    #[serde(skip)]
+    pub loading: Option<(u64, std::sync::mpsc::Receiver<std::io::Result<Vec<FileEntry>>>)>,
+    #[serde(skip)]
+    pub load_gen: u64,
+    #[serde(skip)]
+    pub load_started: Option<Instant>,
+    #[serde(skip)]
+    pub last_reload: Option<Instant>,
+    /// Renomear inline: caminho em edição, texto e "primeiro quadro".
+    #[serde(skip)]
+    pub inline_rename: Option<(PathBuf, String, bool)>,
+    /// Seleção por retângulo: ponto inicial e seleção prévia (Ctrl).
+    #[serde(skip)]
+    pub rubber: Option<egui::Pos2>,
+    #[serde(skip)]
+    pub rubber_base: HashSet<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -127,6 +144,13 @@ impl Tab {
             type_ahead: String::new(),
             type_ahead_at: None,
             loaded_hidden: false,
+            loading: None,
+            load_gen: 0,
+            load_started: None,
+            last_reload: None,
+            inline_rename: None,
+            rubber: None,
+            rubber_base: HashSet::new(),
         }
     }
 
@@ -242,10 +266,59 @@ impl Tab {
 
     // ------------------------------------------------------------------ carregamento
 
+    /// Inicia a leitura da pasta em segundo plano; o resultado chega por `poll_loading`.
     pub fn reload(&mut self, show_hidden: bool) {
         self.needs_reload = false;
         self.loaded_hidden = show_hidden;
-        match read_dir(&self.path, show_hidden) {
+        self.load_gen += 1;
+        let gen = self.load_gen;
+        let path = self.path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("tabex-listdir".into())
+            .spawn(move || {
+                let _ = tx.send(read_dir(&path, show_hidden));
+            })
+            .ok();
+        self.loading = Some((gen, rx));
+        self.load_started = Some(Instant::now());
+        self.last_reload = Some(Instant::now());
+    }
+
+    /// Recebe a listagem pronta, se houver. Retorna `true` se a lista mudou.
+    pub fn poll_loading(&mut self) -> bool {
+        let Some((gen, rx)) = &self.loading else { return false };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.loading = None;
+                return false;
+            }
+        };
+        if *gen != self.load_gen {
+            return false;
+        }
+        self.loading = None;
+        self.apply_listing(result);
+        true
+    }
+
+    /// Está esperando a listagem há mais que um instante? (para mostrar "Carregando…")
+    pub fn is_loading_slow(&self) -> bool {
+        self.loading.is_some()
+            && self
+                .load_started
+                .map(|t| t.elapsed() > Duration::from_millis(120))
+                .unwrap_or(false)
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    fn apply_listing(&mut self, result: std::io::Result<Vec<FileEntry>>) {
+        match result {
             Ok(list) => {
                 self.listing = list;
                 self.error = None;
@@ -276,6 +349,17 @@ impl Tab {
         self.rebuild_rows();
     }
 
+    /// Lê a pasta de forma síncrona (testes e situações em que a lista é necessária já).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reload_blocking(&mut self, show_hidden: bool) {
+        self.needs_reload = false;
+        self.loaded_hidden = show_hidden;
+        self.load_gen += 1;
+        self.loading = None;
+        let result = read_dir(&self.path, show_hidden);
+        self.apply_listing(result);
+    }
+
     /// Verifica periodicamente se a pasta mudou no disco.
     pub fn check_fs_changed(&mut self) -> bool {
         if self.search.is_some() {
@@ -283,7 +367,7 @@ impl Tab {
         }
         let due = self
             .last_check
-            .map(|t| t.elapsed() > Duration::from_millis(1500))
+            .map(|t| t.elapsed() > Duration::from_millis(5000))
             .unwrap_or(true);
         if !due {
             return false;
@@ -298,12 +382,16 @@ impl Tab {
     }
 
     pub fn start_search(&mut self, show_hidden: bool) {
+        self.start_search_mode(show_hidden, false);
+    }
+
+    pub fn start_search_mode(&mut self, show_hidden: bool, content_mode: bool) {
         let text = self.search_text.trim().to_owned();
         if text.is_empty() {
             self.clear_search();
             return;
         }
-        self.search = Some(SearchJob::start(self.path.clone(), text, show_hidden));
+        self.search = Some(SearchJob::start(self.path.clone(), text, show_hidden, content_mode));
         self.selected.clear();
         self.cursor = None;
         self.rebuild_rows();
@@ -660,7 +748,7 @@ mod tests {
     fn listing_sorts_folders_first_and_naturally() {
         let dir = tmp_dir("sort");
         let mut t = Tab::new(1, dir.clone());
-        t.reload(false);
+        t.reload_blocking(false);
         assert_eq!(
             names(&t),
             vec!["pasta_a", "pasta_b", "doc2.txt", "doc10.txt", "foto.jpg"]
@@ -681,7 +769,7 @@ mod tests {
     fn instant_filter_and_selection() {
         let dir = tmp_dir("filter");
         let mut t = Tab::new(1, dir.clone());
-        t.reload(false);
+        t.reload_blocking(false);
         t.search_text = "doc".into();
         t.rebuild_rows();
         assert_eq!(names(&t), vec!["doc2.txt", "doc10.txt"]);
@@ -708,7 +796,7 @@ mod tests {
         let dir = tmp_dir("group");
         let mut t = Tab::new(1, dir.clone());
         t.group_by = GroupBy::Kind;
-        t.reload(false);
+        t.reload_blocking(false);
         let headers: Vec<String> = t
             .rows
             .iter()

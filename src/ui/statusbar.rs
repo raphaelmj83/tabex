@@ -6,6 +6,8 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     let tab = app.session.active_tab();
     let mut clear_filters = false;
     let mut show_update = false;
+    let mut cancel = false;
+    let mut clear_queue = false;
     ui.horizontal(|ui| {
         let n = tab.visible_count();
         ui.label(format!("{} {}", thousands(n as u64), plural(n, "item", "itens")));
@@ -60,11 +62,34 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                 };
                 ui.add(
                     ProgressBar::new(frac)
-                        .desired_width(140.0)
+                        .desired_width(160.0)
                         .desired_height(14.0)
                         .text(RichText::new(format!("{} {}", p.label, p.current)).small()),
                 );
+                if ui
+                    .add(egui::Button::new(RichText::new("✕").small()).frame(false))
+                    .on_hover_text("Cancelar operação")
+                    .clicked()
+                {
+                    cancel = true;
+                }
             }
+        }
+        if !app.op_queue.is_empty() {
+            let n = app.op_queue.len();
+            let r = ui.label(RichText::new(format!("+{n} na fila")).small().weak());
+            r.on_hover_text(app.op_queue.iter().map(|q| q.label()).collect::<Vec<_>>().join("\n"));
+            if ui
+                .add(egui::Button::new(RichText::new("limpar").small()).frame(false))
+                .clicked()
+            {
+                clear_queue = true;
+            }
+        }
+        if tab.is_loading_slow() {
+            ui.separator();
+            ui.spinner();
+            ui.label(RichText::new("Carregando…").small());
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -107,6 +132,12 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     });
     if clear_filters {
         app.pending.push(crate::app::Action::ClearFilters);
+    }
+    if cancel {
+        app.pending.push(crate::app::Action::CancelCurrentOp);
+    }
+    if clear_queue {
+        app.pending.push(crate::app::Action::ClearQueue);
     }
     if show_update {
         app.pending.push(crate::app::Action::ShowUpdateDialog);

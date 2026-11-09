@@ -15,6 +15,9 @@ pub struct Workspace {
     pub groups: Vec<TabGroup>,
     #[serde(default)]
     pub active_group: usize,
+    /// Aberta como janela separada do sistema (viewport).
+    #[serde(default)]
+    pub detached: bool,
 }
 
 impl Workspace {
@@ -25,6 +28,7 @@ impl Workspace {
             color,
             groups: Vec::new(),
             active_group: 0,
+            detached: false,
         }
     }
 

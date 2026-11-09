@@ -1,7 +1,51 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// O que fazer quando o destino já existe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ConflictPolicy {
+    /// Renomeia o novo item ("Nome (2)").
+    #[default]
+    KeepBoth,
+    /// Substitui o existente (pastas são mescladas, arquivos sobrescritos).
+    Replace,
+    /// Não copia/move o item em conflito.
+    Skip,
+}
+
+/// Item em conflito, para o diálogo.
+#[derive(Clone, Debug)]
+pub struct Conflict {
+    pub name: String,
+    pub src: PathBuf,
+    pub dst: PathBuf,
+}
+
+/// Lista os itens de `paths` cujo nome já existe em `dest`.
+pub fn find_conflicts(paths: &[PathBuf], dest: &Path, cut: bool) -> Vec<Conflict> {
+    let mut out = Vec::new();
+    for src in paths {
+        let Some(name) = src.file_name() else { continue };
+        let same_dir = src.parent().map(|p| p == dest).unwrap_or(false);
+        if same_dir {
+            // Copiar na mesma pasta vira "- Cópia"; mover na mesma pasta não faz nada.
+            let _ = cut;
+            continue;
+        }
+        let dst = dest.join(name);
+        if dst.exists() {
+            out.push(Conflict {
+                name: name.to_string_lossy().into_owned(),
+                src: src.clone(),
+                dst,
+            });
+        }
+    }
+    out
+}
 
 /// Área de transferência interna (recortar/copiar).
 #[derive(Clone, Debug)]
@@ -20,6 +64,8 @@ pub struct OpProgress {
     pub error: Option<String>,
     /// Pares (origem, destino) dos itens de nível superior copiados/movidos.
     pub pairs: Vec<(PathBuf, PathBuf)>,
+    /// A operação foi cancelada pelo usuário (não é erro).
+    pub cancelled: bool,
 }
 
 /// Uma operação que pode ser desfeita (ou refeita).
@@ -73,11 +119,71 @@ pub struct OpJob {
     pub refresh: Vec<PathBuf>,
     pub undo: UndoTemplate,
     pub push_to: Stack,
+    pub cancel: Arc<AtomicBool>,
 }
+
+/// Operação ainda não iniciada (fila).
+#[derive(Clone, Debug)]
+pub enum QueuedOp {
+    Paste {
+        clip: Clipboard,
+        dest: PathBuf,
+        policy: ConflictPolicy,
+    },
+    Delete {
+        paths: Vec<PathBuf>,
+        permanent: bool,
+    },
+    UndoRedo {
+        entry: UndoEntry,
+        undo: bool,
+    },
+}
+
+impl QueuedOp {
+    pub fn label(&self) -> String {
+        match self {
+            QueuedOp::Paste { clip, .. } => {
+                format!(
+                    "{} {} {}",
+                    if clip.cut { "Mover" } else { "Copiar" },
+                    clip.paths.len(),
+                    plural(clip.paths.len())
+                )
+            }
+            QueuedOp::Delete { paths, .. } => format!("Excluir {} {}", paths.len(), plural(paths.len())),
+            QueuedOp::UndoRedo { entry, undo } => {
+                format!("{} {}", if *undo { "Desfazer" } else { "Refazer" }, entry.label)
+            }
+        }
+    }
+
+    pub fn start(self) -> OpJob {
+        match self {
+            QueuedOp::Paste { clip, dest, policy } => start_paste_with(&clip, &dest, policy),
+            QueuedOp::Delete { paths, permanent } => start_delete(paths, permanent),
+            QueuedOp::UndoRedo { entry, undo } => start_undo_redo(entry, undo),
+        }
+    }
+}
+
+fn cancelled(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(io::Error::other(CANCEL_MSG))
+    } else {
+        Ok(())
+    }
+}
+
+const CANCEL_MSG: &str = "__cancelado__";
 
 impl OpJob {
     pub fn is_finished(&self) -> bool {
         self.progress.lock().map(|p| p.finished).unwrap_or(true)
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 
     /// Entrada de desfazer/refazer resultante (só faz sentido após terminar sem erro).
@@ -121,8 +227,10 @@ fn record_pair(progress: &Arc<Mutex<OpProgress>>, src: &Path, dst: &Path) {
 fn finish(progress: &Arc<Mutex<OpProgress>>, result: Result<(), String>) {
     if let Ok(mut p) = progress.lock() {
         p.finished = true;
-        if let Err(e) = result {
-            p.error = Some(e);
+        match result {
+            Err(e) if e.contains(CANCEL_MSG) => p.cancelled = true,
+            Err(e) => p.error = Some(e),
+            Ok(()) => {}
         }
     }
 }
@@ -155,6 +263,11 @@ fn tick(progress: &Arc<Mutex<OpProgress>>) {
 }
 
 fn copy_recursive(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>) -> io::Result<()> {
+    copy_recursive_c(src, dst, progress, &AtomicBool::new(false))
+}
+
+fn copy_recursive_c(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>, cancel: &AtomicBool) -> io::Result<()> {
+    cancelled(cancel)?;
     set_current(progress, src);
     let md = fs::metadata(src)?;
     if md.is_dir() {
@@ -162,9 +275,12 @@ fn copy_recursive(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>) -> 
         tick(progress);
         for entry in fs::read_dir(src)? {
             let entry = entry?;
-            copy_recursive(&entry.path(), &dst.join(entry.file_name()), progress)?;
+            copy_recursive_c(&entry.path(), &dst.join(entry.file_name()), progress, cancel)?;
         }
     } else {
+        if dst.is_dir() {
+            fs::remove_dir_all(dst)?;
+        }
         fs::copy(src, dst)?;
         tick(progress);
     }
@@ -172,7 +288,24 @@ fn copy_recursive(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>) -> 
 }
 
 fn move_path(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>) -> io::Result<()> {
+    move_path_c(src, dst, progress, &AtomicBool::new(false))
+}
+
+fn move_path_c(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>, cancel: &AtomicBool) -> io::Result<()> {
+    cancelled(cancel)?;
     set_current(progress, src);
+    if dst.exists() && !(src.is_dir() && dst.is_dir()) {
+        // Substituir arquivo: remove o destino antes do rename.
+        remove_any(dst)?;
+    }
+    if src.is_dir() && dst.is_dir() {
+        // Mesclar pasta em pasta existente.
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            move_path_c(&entry.path(), &dst.join(entry.file_name()), progress, cancel)?;
+        }
+        return fs::remove_dir(src);
+    }
     match fs::rename(src, dst) {
         Ok(()) => {
             tick(progress);
@@ -180,7 +313,7 @@ fn move_path(src: &Path, dst: &Path, progress: &Arc<Mutex<OpProgress>>) -> io::R
         }
         Err(_) => {
             // Provavelmente outro volume: copia e remove.
-            copy_recursive(src, dst, progress)?;
+            copy_recursive_c(src, dst, progress, cancel)?;
             if src.is_dir() {
                 fs::remove_dir_all(src)
             } else {
@@ -230,11 +363,19 @@ fn split_name(name: &str) -> (String, String) {
     }
 }
 
-/// Cola os itens da área de transferência em `dest`.
+/// Cola os itens da área de transferência em `dest` (conflitos: "manter ambos").
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn start_paste(clip: &Clipboard, dest: &Path) -> OpJob {
+    start_paste_with(clip, dest, ConflictPolicy::KeepBoth)
+}
+
+/// Cola os itens da área de transferência em `dest` com a política de conflito dada.
+pub fn start_paste_with(clip: &Clipboard, dest: &Path, policy: ConflictPolicy) -> OpJob {
     let paths = clip.paths.clone();
     let cut = clip.cut;
     let dest = dest.to_path_buf();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_t = cancel.clone();
     let progress = Arc::new(Mutex::new(OpProgress {
         label: if cut {
             "Movendo".to_owned()
@@ -264,20 +405,31 @@ pub fn start_paste(clip: &Clipboard, dest: &Path) -> OpJob {
                     )));
                 }
                 let same_dir = src.parent().map(|p| p == dest).unwrap_or(false);
+                let plain = dest.join(&name);
+                let conflict = !same_dir && plain.exists();
+                if conflict && policy == ConflictPolicy::Skip {
+                    continue;
+                }
                 if cut {
                     if same_dir {
                         continue;
                     }
-                    let dst = unique_path(&dest, &name);
-                    move_path(src, &dst, &prog)?;
+                    let dst = if conflict && policy == ConflictPolicy::Replace {
+                        plain
+                    } else {
+                        unique_path(&dest, &name)
+                    };
+                    move_path_c(src, &dst, &prog, &cancel_t)?;
                     record_pair(&prog, src, &dst);
                 } else {
                     let dst = if same_dir {
                         copy_name(&dest, &name)
+                    } else if conflict && policy == ConflictPolicy::Replace {
+                        plain
                     } else {
                         unique_path(&dest, &name)
                     };
-                    copy_recursive(src, &dst, &prog)?;
+                    copy_recursive_c(src, &dst, &prog, &cancel_t)?;
                     record_pair(&prog, src, &dst);
                 }
             }
@@ -285,11 +437,20 @@ pub fn start_paste(clip: &Clipboard, dest: &Path) -> OpJob {
         })();
         finish(&prog, result.map_err(|e| e.to_string()));
     });
+    // Substituir destrói os originais do destino: não há como desfazer com segurança.
+    let undo = if policy == ConflictPolicy::Replace {
+        UndoTemplate::None
+    } else if cut {
+        UndoTemplate::Move
+    } else {
+        UndoTemplate::Copy
+    };
     OpJob {
         progress,
         refresh,
-        undo: if cut { UndoTemplate::Move } else { UndoTemplate::Copy },
+        undo,
         push_to: Stack::Undo,
+        cancel,
     }
 }
 
@@ -340,6 +501,7 @@ pub fn start_delete(paths: Vec<PathBuf>, permanent: bool) -> OpJob {
         refresh,
         undo,
         push_to: Stack::Undo,
+        cancel: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -541,6 +703,7 @@ pub fn start_undo_redo(entry: UndoEntry, undo: bool) -> OpJob {
         refresh,
         undo: UndoTemplate::Fixed(entry),
         push_to: if undo { Stack::Redo } else { Stack::Undo },
+        cancel: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -729,6 +892,46 @@ mod tests {
         let job = start_undo_redo(entry, true);
         wait(&job);
         assert!(!dir.join("renomeado.txt").exists());
+
+        // conflitos: detectar, pular e substituir
+        let c1 = dir.join("conf.txt");
+        fs::write(&c1, b"novo").unwrap();
+        fs::write(folder.join("conf.txt"), b"antigo").unwrap();
+        let conflicts = find_conflicts(std::slice::from_ref(&c1), &folder, false);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].name, "conf.txt");
+        let clip = Clipboard {
+            paths: vec![c1.clone()],
+            cut: false,
+        };
+        let job = start_paste_with(&clip, &folder, ConflictPolicy::Skip);
+        wait(&job);
+        assert_eq!(fs::read(folder.join("conf.txt")).unwrap(), b"antigo");
+        assert!(job.undo_entry().is_none());
+        let job = start_paste_with(&clip, &folder, ConflictPolicy::Replace);
+        wait(&job);
+        assert_eq!(fs::read(folder.join("conf.txt")).unwrap(), b"novo");
+        assert!(job.undo_entry().is_none());
+        let job = start_paste_with(&clip, &folder, ConflictPolicy::KeepBoth);
+        wait(&job);
+        assert!(folder.join("conf (2).txt").exists());
+
+        // cancelar: a flag interrompe e marca como cancelado, sem erro
+        let big = dir.join("big");
+        fs::create_dir_all(&big).unwrap();
+        for i in 0..300 {
+            fs::write(big.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let clip = Clipboard {
+            paths: vec![big.clone()],
+            cut: false,
+        };
+        let job = start_paste_with(&clip, &folder, ConflictPolicy::KeepBoth);
+        job.request_cancel();
+        wait(&job);
+        let p = job.progress.lock().unwrap();
+        assert!(p.cancelled || p.error.is_none());
+        drop(p);
 
         // excluir permanentemente
         let job = start_delete(vec![again.clone()], true);

@@ -1,7 +1,8 @@
 use crate::fs::cloud::{self, CloudFolder};
 use crate::fs::entry::{list_drives, FileEntry};
-use crate::fs::ops::{self, Clipboard, OpJob, Stack, UndoEntry};
+use crate::fs::ops::{self, Clipboard, ConflictPolicy, OpJob, QueuedOp, Stack, UndoEntry};
 use crate::fs::sysclip;
+use crate::fs::thumbs::ThumbService;
 use crate::model::color::GroupColor;
 use crate::model::session::Session;
 use crate::model::tab::{GroupBy, SortKey, Tab};
@@ -9,6 +10,7 @@ use crate::platform::{self, MenuExtra};
 use crate::shortcuts;
 use crate::ui;
 use crate::ui::dialogs::Dialog;
+use crate::ui::dnd::FileDrag;
 use crate::update::{UpdateState, Updater};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::path::PathBuf;
@@ -75,6 +77,10 @@ pub enum Action {
         w: usize,
     },
     MoveTabToNewWindow(usize, usize),
+    /// Abre a janela `w` como janela separada do sistema.
+    DetachWindow(usize),
+    /// Traz a janela (por id) de volta para a janela principal.
+    AttachWindow(u64),
 
     /// Menu de contexto nativo do sistema (Windows) para `paths`, ou da pasta se vazio.
     NativeMenu {
@@ -99,6 +105,22 @@ pub enum Action {
     Redo,
     PushUndo(UndoEntry),
     RollbackUpdate,
+    /// Enfileira uma operação (executa quando a atual terminar).
+    Enqueue(QueuedOp),
+    /// Cola com política de conflito já decidida.
+    PasteWith {
+        clip: Clipboard,
+        dest: PathBuf,
+        policy: ConflictPolicy,
+    },
+    CancelCurrentOp,
+    ClearQueue,
+    /// Arquivos soltos de fora (Explorer) na pasta `dest`; `cut` move em vez de copiar.
+    DropFiles {
+        paths: Vec<PathBuf>,
+        dest: PathBuf,
+        cut: bool,
+    },
     PasteInto(PathBuf),
     Delete {
         permanent: bool,
@@ -126,6 +148,9 @@ pub enum Action {
     ToggleHidden,
     ToggleTheme,
     ToggleSidebar,
+    SetViewIcons(bool),
+    TogglePreview,
+    ToggleSearchContent,
     FocusAddress,
     FocusSearch,
     ClearSearch,
@@ -154,6 +179,20 @@ pub struct TabexApp {
     pub pending_copy_text: Option<String>,
     pub undo_stack: Vec<UndoEntry>,
     pub redo_stack: Vec<UndoEntry>,
+    pub op_queue: std::collections::VecDeque<QueuedOp>,
+    pub thumbs: Option<ThumbService>,
+    pub preview_cache: crate::ui::preview::PreviewCache,
+    /// Pasta sob o ponteiro durante um arrasto vindo de fora (para o aviso visual).
+    pub hovering_external: bool,
+    /// Renderizando uma janela separada (viewport) neste momento.
+    pub in_detached: bool,
+    /// Viewport a focar no próximo quadro (clique numa janela separada).
+    focus_viewport: Option<egui::ViewportId>,
+    /// Salvar sessão em disco (desligado em testes).
+    persist: bool,
+    watcher: Option<notify::RecommendedWatcher>,
+    watch_rx: Option<std::sync::mpsc::Receiver<PathBuf>>,
+    watched: Option<PathBuf>,
     /// Há arquivos na área de transferência do sistema (atualizado uma vez por quadro).
     pub sys_clip_has_files: bool,
     /// Sequência da área de transferência quando o Tabex a escreveu pela última vez.
@@ -190,6 +229,16 @@ impl TabexApp {
             pending_copy_text: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            op_queue: std::collections::VecDeque::new(),
+            thumbs: Some(ThumbService::new()),
+            preview_cache: Default::default(),
+            hovering_external: false,
+            in_detached: false,
+            focus_viewport: None,
+            persist: true,
+            watcher: None,
+            watch_rx: None,
+            watched: None,
             sys_clip_has_files: false,
             clip_seq: None,
             drives_at: Instant::now(),
@@ -199,6 +248,62 @@ impl TabexApp {
             last_save: Instant::now(),
             last_title: String::new(),
         }
+    }
+
+    /// Instância para testes: sessão nova apontando para `root`, sem rede nem gravação em disco.
+    pub fn for_test(root: PathBuf) -> Self {
+        let mut session = Session::fresh();
+        session.auto_update = false;
+        session.use_native_menu = false;
+        session.active_tab_mut().navigate(root);
+        TabexApp {
+            theme_applied: None,
+            session,
+            clipboard: None,
+            dialog: Dialog::None,
+            ops: Vec::new(),
+            address_edit: None,
+            focus_address: false,
+            focus_search: false,
+            pending: Vec::new(),
+            closed_tabs: Vec::new(),
+            toast: None,
+            drives: Vec::new(),
+            clouds: Vec::new(),
+            updater: Updater::new(),
+            hwnd: None,
+            pending_copy_text: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            sys_clip_has_files: false,
+            clip_seq: None,
+            op_queue: std::collections::VecDeque::new(),
+            thumbs: None,
+            preview_cache: Default::default(),
+            hovering_external: false,
+            in_detached: false,
+            focus_viewport: None,
+            persist: false,
+            watcher: None,
+            watch_rx: None,
+            watched: None,
+            drives_at: Instant::now(),
+            clouds_at: Instant::now(),
+            restart_requested: false,
+            dirty: false,
+            last_save: Instant::now(),
+            last_title: String::new(),
+        }
+    }
+
+    /// Um quadro completo sem `eframe::Frame` (usado pelos testes de interface).
+    pub fn frame_for_test(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        // Sem fontes do sistema nos testes: glifos ausentes viram "tofu" em vez de pânico.
+        ctx.set_missing_glyph_policy(egui::epaint::text::MissingGlyphPolicy::Tofu);
+        self.logic_ctx(&ctx);
+        self.render_root(ui);
+        self.frame_end(&ctx);
     }
 
     pub fn toast(&mut self, msg: impl Into<String>) {
@@ -228,16 +333,27 @@ impl TabexApp {
         let mut finished = Vec::new();
         self.ops.retain(|op| {
             if op.is_finished() {
-                let err = op.progress.lock().ok().and_then(|p| p.error.clone());
-                let entry = if err.is_none() { op.undo_entry() } else { None };
-                finished.push((op.refresh.clone(), err, entry, op.push_to));
+                let (err, cancelled) = op
+                    .progress
+                    .lock()
+                    .map(|p| (p.error.clone(), p.cancelled))
+                    .unwrap_or((None, false));
+                let entry = if err.is_none() && !cancelled {
+                    op.undo_entry()
+                } else {
+                    None
+                };
+                finished.push((op.refresh.clone(), err, entry, op.push_to, cancelled));
                 false
             } else {
                 true
             }
         });
-        for (dirs, err, entry, stack) in finished {
+        for (dirs, err, entry, stack, cancelled) in finished {
             self.refresh_dirs(&dirs);
+            if cancelled {
+                self.toast("Operação cancelada");
+            }
             if let Some(e) = err {
                 self.error(e);
             } else if let Some(entry) = entry {
@@ -256,8 +372,28 @@ impl TabexApp {
             }
         }
         self.sys_clip_has_files = sysclip::has_files();
+        // Fila: uma operação por vez.
+        if self.ops.is_empty() {
+            if let Some(next) = self.op_queue.pop_front() {
+                self.ops.push(next.start());
+            }
+        }
         if !self.ops.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        // Monitoramento da pasta ativa (notify) com polling de segurança.
+        self.update_watcher(ctx);
+        let mut changed_dirs: Vec<PathBuf> = Vec::new();
+        if let Some(rx) = &self.watch_rx {
+            while let Ok(p) = rx.try_recv() {
+                changed_dirs.push(p);
+            }
+        }
+        if !changed_dirs.is_empty() {
+            changed_dirs.sort();
+            changed_dirs.dedup();
+            self.refresh_dirs(&changed_dirs);
         }
 
         // Pesquisa, recarregamento e detecção de mudanças no disco.
@@ -270,19 +406,35 @@ impl TabexApp {
                 if t.poll_search() {
                     busy = true;
                 }
+                if t.poll_loading() {
+                    busy = true;
+                }
                 if visible {
                     t.check_fs_changed();
                     if t.needs_reload || t.loaded_hidden != show_hidden {
-                        t.reload(show_hidden);
+                        // Agrupa rajadas de eventos: no máximo uma releitura a cada 250 ms.
+                        let recent = t
+                            .last_reload
+                            .map(|r| r.elapsed() < Duration::from_millis(250))
+                            .unwrap_or(false);
+                        if recent && t.loaded_hidden == show_hidden {
+                            busy = true;
+                        } else {
+                            t.reload(show_hidden);
+                            busy = true;
+                        }
+                    }
+                    if t.is_loading() {
+                        busy = true;
                     }
                 }
             }
         }
         if busy {
-            ctx.request_repaint_after(Duration::from_millis(120));
+            ctx.request_repaint_after(Duration::from_millis(60));
         } else if self.session.active_tab().search.is_none() {
-            // Verificação periódica da pasta ativa.
-            ctx.request_repaint_after(Duration::from_millis(1500));
+            // Verificação periódica da pasta ativa (fallback do notify).
+            ctx.request_repaint_after(Duration::from_millis(5000));
         }
 
         if self.drives_at.elapsed() > Duration::from_secs(10) {
@@ -292,6 +444,47 @@ impl TabexApp {
         if self.clouds_at.elapsed() > Duration::from_secs(30) {
             self.clouds = cloud::detect();
             self.clouds_at = Instant::now();
+        }
+        if let Some(t) = &self.thumbs {
+            if t.poll(ctx) {
+                ctx.request_repaint();
+            }
+        }
+
+        // Arquivos soltos de fora (Explorer etc.) vão para a pasta ativa.
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        self.hovering_external = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if !dropped.is_empty() {
+            let dest = self.session.active_tab().path.clone();
+            let cut = ctx.input(|i| i.modifiers.shift);
+            self.pending.push(Action::DropFiles {
+                paths: dropped,
+                dest,
+                cut,
+            });
+        }
+
+        // Arrasto interno que saiu da janela: entrega ao sistema (Windows).
+        if platform::drag_out_supported() {
+            if let Some(p) = egui::DragAndDrop::payload::<FileDrag>(ctx) {
+                let outside = ctx.input(|i| i.pointer.primary_down() && i.pointer.hover_pos().is_none());
+                if outside {
+                    egui::DragAndDrop::clear_payload(ctx);
+                    match platform::drag_out(&p.paths) {
+                        Ok(moved) => {
+                            if moved {
+                                let dirs: Vec<PathBuf> = p
+                                    .paths
+                                    .iter()
+                                    .filter_map(|x| x.parent().map(|d| d.to_path_buf()))
+                                    .collect();
+                                self.refresh_dirs(&dirs);
+                            }
+                        }
+                        Err(e) => self.toast(format!("Arrastar para fora: {e}")),
+                    }
+                }
+            }
         }
 
         // Atualizações: verificação automática (uma vez por dia) e aviso quando houver versão nova.
@@ -569,8 +762,45 @@ impl TabexApp {
                 }
             }
             SwitchWindow(w) => {
-                self.session.switch_window(w);
+                if self.session.windows.get(w).map(|x| x.detached).unwrap_or(false) && !self.in_detached {
+                    let id = self.session.windows[w].id;
+                    self.focus_viewport = Some(egui::ViewportId::from_hash_of(("tabex-window", id)));
+                } else {
+                    self.session.switch_window(w);
+                    self.dirty = true;
+                }
+            }
+            DetachWindow(w) => {
+                if w >= self.session.windows.len() {
+                    return;
+                }
+                if self.session.windows.len() < 2 {
+                    self.toast("Crie outra janela antes de separar esta (Ctrl+Alt+T)");
+                    return;
+                }
+                if w == self.session.active_window {
+                    let other = if w + 1 < self.session.windows.len() {
+                        w + 1
+                    } else {
+                        w - 1
+                    };
+                    let other = (0..self.session.windows.len())
+                        .find(|&i| i != w && !self.session.windows[i].detached)
+                        .unwrap_or(other);
+                    if other == w {
+                        self.toast("Traga outra janela de volta antes de separar esta");
+                        return;
+                    }
+                    self.session.switch_window(other);
+                }
+                self.session.windows[w].detached = true;
                 self.dirty = true;
+            }
+            AttachWindow(id) => {
+                if let Some(w) = self.session.windows.iter_mut().find(|x| x.id == id) {
+                    w.detached = false;
+                    self.dirty = true;
+                }
             }
             CycleWindow(d) => {
                 self.session.cycle_window(d);
@@ -686,28 +916,48 @@ impl TabexApp {
                     }
                 }
                 if let Some(clip) = self.clipboard.clone() {
-                    let job = ops::start_paste(&clip, &dest);
-                    self.ops.push(job);
                     if clip.cut {
                         self.clipboard = None;
                         self.clip_seq = None;
                     }
+                    self.paste_clip(clip, dest);
+                }
+            }
+            PasteWith { clip, dest, policy } => {
+                self.enqueue(QueuedOp::Paste { clip, dest, policy });
+            }
+            Enqueue(op) => self.enqueue(op),
+            CancelCurrentOp => {
+                for op in &self.ops {
+                    op.request_cancel();
+                }
+            }
+            ClearQueue => {
+                let n = self.op_queue.len();
+                self.op_queue.clear();
+                if n > 0 {
+                    self.toast(format!("{n} operação(ões) removida(s) da fila"));
+                }
+            }
+            DropFiles { paths, dest, cut } => {
+                if !paths.is_empty() && dest.is_dir() {
+                    // Soltar na própria pasta de origem não faz nada.
+                    let all_same = paths.iter().all(|p| p.parent() == Some(dest.as_path()));
+                    if !all_same {
+                        self.paste_clip(Clipboard { paths, cut }, dest);
+                    }
                 }
             }
             Undo => {
-                if !self.ops.is_empty() {
-                    self.toast("Aguarde a operação atual terminar");
-                } else if let Some(entry) = self.undo_stack.pop() {
-                    self.ops.push(ops::start_undo_redo(entry, true));
+                if let Some(entry) = self.undo_stack.pop() {
+                    self.enqueue(QueuedOp::UndoRedo { entry, undo: true });
                 } else {
                     self.toast("Nada para desfazer");
                 }
             }
             Redo => {
-                if !self.ops.is_empty() {
-                    self.toast("Aguarde a operação atual terminar");
-                } else if let Some(entry) = self.redo_stack.pop() {
-                    self.ops.push(ops::start_undo_redo(entry, false));
+                if let Some(entry) = self.redo_stack.pop() {
+                    self.enqueue(QueuedOp::UndoRedo { entry, undo: false });
                 } else {
                     self.toast("Nada para refazer");
                 }
@@ -832,6 +1082,18 @@ impl TabexApp {
                 self.session.sidebar_visible = !self.session.sidebar_visible;
                 self.dirty = true;
             }
+            SetViewIcons(v) => {
+                self.session.view_icons = v;
+                self.dirty = true;
+            }
+            TogglePreview => {
+                self.session.preview_visible = !self.session.preview_visible;
+                self.dirty = true;
+            }
+            ToggleSearchContent => {
+                self.session.search_content = !self.session.search_content;
+                self.dirty = true;
+            }
             FocusAddress => {
                 let p = self.session.active_tab().path.to_string_lossy().into_owned();
                 self.address_edit = Some(p);
@@ -858,6 +1120,74 @@ impl TabexApp {
 
             ShowShortcuts => self.dialog = Dialog::Shortcuts,
             Toast(msg) => self.toast(msg),
+        }
+    }
+
+    /// Mantém o `notify` observando a pasta da aba ativa.
+    fn update_watcher(&mut self, ctx: &egui::Context) {
+        use notify::Watcher;
+        let want = self.session.active_tab().path.clone();
+        if self.watched.as_ref() == Some(&want) {
+            return;
+        }
+        if self.watcher.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+            let ctx2 = ctx.clone();
+            let watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(ev) = res {
+                    for p in ev.paths {
+                        // O evento traz o arquivo; a pasta a recarregar é a pai (e a própria, se for pasta).
+                        if let Some(parent) = p.parent() {
+                            let _ = tx.send(parent.to_path_buf());
+                        }
+                        let _ = tx.send(p);
+                    }
+                    ctx2.request_repaint();
+                }
+            });
+            match watcher {
+                Ok(w) => {
+                    self.watcher = Some(w);
+                    self.watch_rx = Some(rx);
+                }
+                Err(e) => {
+                    eprintln!("notify indisponível, usando polling: {e}");
+                    self.watched = Some(want);
+                    return;
+                }
+            }
+        }
+        if let Some(w) = self.watcher.as_mut() {
+            if let Some(old) = self.watched.take() {
+                let _ = w.unwatch(&old);
+            }
+            if let Err(e) = w.watch(&want, notify::RecursiveMode::NonRecursive) {
+                eprintln!("não foi possível observar {}: {e}", want.display());
+            }
+        }
+        self.watched = Some(want);
+    }
+
+    /// Inicia (ou enfileira) uma colagem, perguntando sobre conflitos quando houver.
+    fn paste_clip(&mut self, clip: Clipboard, dest: PathBuf) {
+        let conflicts = ops::find_conflicts(&clip.paths, &dest, clip.cut);
+        if conflicts.is_empty() {
+            self.enqueue(QueuedOp::Paste {
+                clip,
+                dest,
+                policy: ConflictPolicy::KeepBoth,
+            });
+        } else {
+            self.dialog = Dialog::Conflict { clip, dest, conflicts };
+        }
+    }
+
+    fn enqueue(&mut self, op: QueuedOp) {
+        if self.ops.is_empty() && self.op_queue.is_empty() {
+            self.ops.push(op.start());
+        } else {
+            self.toast(format!("Na fila: {}", op.label()));
+            self.op_queue.push_back(op);
         }
     }
 
@@ -917,7 +1247,8 @@ impl TabexApp {
                 },
             });
         }
-        match platform::show_native_menu(self.hwnd, &paths, &folder, &extras) {
+        let hwnd = if self.in_detached { None } else { self.hwnd };
+        match platform::show_native_menu(hwnd, &paths, &folder, &extras) {
             Ok(r) => {
                 match r.extra {
                     Some(OPEN_TAB) => self.apply(Action::OpenInNewTab(paths[0].clone())),
@@ -996,43 +1327,62 @@ pub fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     }
 }
 
-impl eframe::App for TabexApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl TabexApp {
+    /// Lógica de um quadro: tema, trabalhos em segundo plano e atalhos da janela principal.
+    pub fn logic_ctx(&mut self, ctx: &egui::Context) {
         if self.theme_applied != Some(self.session.dark_theme) {
             ui::theme::apply(ctx, self.session.dark_theme);
             self.theme_applied = Some(self.session.dark_theme);
         }
-
         self.poll_jobs(ctx);
-
         if matches!(self.dialog, Dialog::None) {
             let acts = shortcuts::collect(ctx, self.address_edit.is_some());
             self.pending.extend(acts);
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    /// Conteúdo da janela principal: barra de janelas + espaço de trabalho ativo + diálogos.
+    pub fn render_root(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.render_workspace(ui, true);
+        ui::dnd::ghost(&ctx);
+        ui::dialogs::show(&ctx, self);
+        self.drain_actions(&ctx);
+        if let Some(v) = self.focus_viewport.take() {
+            ctx.send_viewport_cmd_to(v, egui::ViewportCommand::Focus);
+        }
+    }
+
+    /// Painéis de um espaço de trabalho (o ativo em `session`). `main` mostra a barra de janelas;
+    /// caso contrário mostra o cabeçalho de janela separada.
+    pub fn render_workspace(&mut self, ui: &mut egui::Ui, main: bool) {
         let ctx = ui.ctx().clone();
         let visuals = ctx.global_style().visuals.clone();
-        if self.hwnd.is_none() {
-            if let Ok(h) = frame.window_handle() {
-                if let RawWindowHandle::Win32(w) = h.as_raw() {
-                    self.hwnd = Some(w.hwnd.get());
-                }
-            }
+        let vid = ctx.viewport_id();
+
+        if main {
+            egui::Panel::top(("windowbar", vid))
+                .exact_size(ui::windowbar::HEIGHT)
+                .frame(egui::Frame::new().fill(visuals.panel_fill).inner_margin(egui::Margin {
+                    left: 8,
+                    right: 4,
+                    top: 3,
+                    bottom: 0,
+                }))
+                .show(ui, |ui| ui::windowbar::show(ui, self));
+        } else {
+            egui::Panel::top(("detached_header", vid))
+                .exact_size(ui::windowbar::HEIGHT)
+                .frame(egui::Frame::new().fill(visuals.panel_fill).inner_margin(egui::Margin {
+                    left: 8,
+                    right: 4,
+                    top: 3,
+                    bottom: 0,
+                }))
+                .show(ui, |ui| ui::windowbar::show_detached_header(ui, self));
         }
 
-        egui::Panel::top("windowbar")
-            .exact_size(ui::windowbar::HEIGHT)
-            .frame(egui::Frame::new().fill(visuals.panel_fill).inner_margin(egui::Margin {
-                left: 8,
-                right: 4,
-                top: 3,
-                bottom: 0,
-            }))
-            .show(ui, |ui| ui::windowbar::show(ui, self));
-
-        egui::Panel::top("tabstrip")
+        egui::Panel::top(("tabstrip", vid))
             .exact_size(36.0)
             .frame(egui::Frame::new().fill(visuals.panel_fill).inner_margin(egui::Margin {
                 left: 4,
@@ -1042,7 +1392,7 @@ impl eframe::App for TabexApp {
             }))
             .show(ui, |ui| ui::tabstrip::show(ui, self));
 
-        egui::Panel::top("toolbar")
+        egui::Panel::top(("toolbar", vid))
             .resizable(false)
             .frame(
                 egui::Frame::new()
@@ -1051,7 +1401,7 @@ impl eframe::App for TabexApp {
             )
             .show(ui, |ui| ui::toolbar::show(ui, self));
 
-        egui::Panel::bottom("status")
+        egui::Panel::bottom(("status", vid))
             .exact_size(26.0)
             .frame(
                 egui::Frame::new()
@@ -1061,7 +1411,7 @@ impl eframe::App for TabexApp {
             .show(ui, |ui| ui::statusbar::show(ui, self));
 
         if self.session.sidebar_visible {
-            egui::Panel::left("sidebar")
+            egui::Panel::left(("sidebar", vid))
                 .resizable(true)
                 .default_size(230.0)
                 .size_range(160.0..=420.0)
@@ -1073,17 +1423,56 @@ impl eframe::App for TabexApp {
                 .show(ui, |ui| ui::sidebar::show(ui, self));
         }
 
+        if self.session.preview_visible {
+            egui::Panel::right(("preview", vid))
+                .resizable(true)
+                .default_size(300.0)
+                .size_range(200.0..=700.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(visuals.panel_fill)
+                        .inner_margin(egui::Margin::symmetric(8, 6)),
+                )
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| ui::preview::show(ui, self));
+                });
+        }
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(visuals.extreme_bg_color)
                     .inner_margin(egui::Margin::same(0)),
             )
-            .show(ui, |ui| ui::filelist::show(ui, self));
+            .show(ui, |ui| {
+                ui::filelist::show(ui, self);
+                if self.hovering_external {
+                    let r = ui.max_rect();
+                    ui.painter().rect(
+                        r.shrink(4.0),
+                        6,
+                        egui::Color32::from_rgba_unmultiplied(0x1A, 0x73, 0xE8, 18),
+                        egui::Stroke::new(2.0, visuals.hyperlink_color),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!(
+                            "Solte para copiar em \"{}\" (Shift: mover)",
+                            self.session.active_tab().title()
+                        ),
+                        egui::FontId::proportional(16.0),
+                        visuals.hyperlink_color,
+                    );
+                }
+            });
+    }
 
-        ui::dialogs::show(&ctx, self);
-
-        // Aplica ações enfileiradas (ações podem gerar novas ações).
+    /// Aplica as ações enfileiradas (ações podem gerar novas ações).
+    pub fn drain_actions(&mut self, ctx: &egui::Context) {
         let mut guard = 0;
         while !self.pending.is_empty() && guard < 50 {
             let batch = std::mem::take(&mut self.pending);
@@ -1095,15 +1484,83 @@ impl eframe::App for TabexApp {
         if let Some(text) = self.pending_copy_text.take() {
             ctx.copy_text(text);
         }
+    }
 
-        self.update_title(&ctx);
+    /// Janelas separadas (viewports imediatos): cada uma renderiza seu espaço de trabalho.
+    fn render_detached(&mut self, ctx: &egui::Context) {
+        let ids: Vec<u64> = self
+            .session
+            .windows
+            .iter()
+            .filter(|w| w.detached)
+            .map(|w| w.id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let main_id = self.session.active_workspace().id;
+        for id in ids {
+            let Some(idx) = self.session.windows.iter().position(|w| w.id == id && w.detached) else {
+                continue;
+            };
+            if idx == self.session.active_window {
+                continue;
+            }
+            let name = self.session.windows[idx].name.clone();
+            self.session.switch_window(idx);
+            self.in_detached = true;
+            let vid = egui::ViewportId::from_hash_of(("tabex-window", id));
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("{name} - Tabex"))
+                .with_inner_size([1100.0, 720.0])
+                .with_min_inner_size([640.0, 400.0]);
+            let mut reattach = false;
+            ctx.show_viewport_immediate(vid, builder, |ui, class| {
+                if class == egui::ViewportClass::EmbeddedWindow {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Janelas separadas não são suportadas neste sistema.");
+                    });
+                    reattach = true;
+                    return;
+                }
+                let vctx = ui.ctx().clone();
+                if matches!(self.dialog, Dialog::None) {
+                    let acts = shortcuts::collect(&vctx, self.address_edit.is_some());
+                    self.pending.extend(acts);
+                }
+                self.render_workspace(ui, false);
+                ui::dnd::ghost(&vctx);
+                self.drain_actions(&vctx);
+                if vctx.input(|i| i.viewport().close_requested()) {
+                    reattach = true;
+                }
+            });
+            self.in_detached = false;
+            if reattach {
+                if let Some(w) = self.session.windows.iter_mut().find(|w| w.id == id) {
+                    w.detached = false;
+                }
+                self.dirty = true;
+            }
+            // Volta para a janela principal (pelo id, pois índices podem ter mudado).
+            if let Some(back) = self.session.windows.iter().position(|w| w.id == main_id) {
+                self.session.switch_window(back);
+            } else if let Some(back) = self.session.windows.iter().position(|w| !w.detached) {
+                self.session.switch_window(back);
+            }
+        }
+    }
+
+    /// Fim do quadro: título, reinício, salvamento e expiração do aviso.
+    pub fn frame_end(&mut self, ctx: &egui::Context) {
+        self.update_title(ctx);
 
         if self.restart_requested {
             let _ = self.session.save();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        if self.dirty && self.last_save.elapsed() > Duration::from_secs(2) {
+        if self.persist && self.dirty && self.last_save.elapsed() > Duration::from_secs(2) {
             if let Err(e) = self.session.save() {
                 eprintln!("falha ao salvar sessão: {e}");
             }
@@ -1118,10 +1575,32 @@ impl eframe::App for TabexApp {
             }
         }
     }
+}
+
+impl eframe::App for TabexApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.logic_ctx(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if self.hwnd.is_none() {
+            if let Ok(h) = frame.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    self.hwnd = Some(w.hwnd.get());
+                }
+            }
+        }
+        self.render_root(ui);
+        self.render_detached(&ctx);
+        self.frame_end(&ctx);
+    }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Err(e) = self.session.save() {
-            eprintln!("falha ao salvar sessão: {e}");
+        if self.persist {
+            if let Err(e) = self.session.save() {
+                eprintln!("falha ao salvar sessão: {e}");
+            }
         }
     }
 }

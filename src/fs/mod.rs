@@ -4,3 +4,4 @@ pub mod filter;
 pub mod ops;
 pub mod search;
 pub mod sysclip;
+pub mod thumbs;

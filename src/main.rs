@@ -1,12 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod fs;
-mod model;
-mod platform;
-mod shortcuts;
-mod ui;
-mod update;
+use tabex::app;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

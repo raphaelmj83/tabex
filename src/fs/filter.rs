@@ -246,6 +246,8 @@ pub enum KindSel {
 #[derive(Clone, Debug, Default)]
 pub struct Query {
     pub terms: Vec<String>,
+    /// Termos que devem aparecer no conteúdo do arquivo (`conteudo:palavra`).
+    pub content: Vec<String>,
     pub exts: Vec<String>,
     pub kind: Option<KindSel>,
     pub min_size: Option<u64>,
@@ -296,6 +298,12 @@ impl Query {
                         q.date = DateFilter::parse(v);
                         continue;
                     }
+                    "conteudo" | "conteúdo" | "texto" | "content" => {
+                        if !v.is_empty() {
+                            q.content.push(v.to_owned());
+                        }
+                        continue;
+                    }
                     _ => {}
                 }
             }
@@ -306,6 +314,7 @@ impl Query {
 
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()
+            && self.content.is_empty()
             && self.exts.is_empty()
             && self.kind.is_none()
             && self.min_size.is_none()
@@ -429,8 +438,9 @@ mod tests {
 
     #[test]
     fn query_parses_prefixes() {
-        let q = Query::parse("relatorio ext:pdf,docx tipo:arquivo tamanho:>1mb data:hoje");
+        let q = Query::parse("relatorio ext:pdf,docx tipo:arquivo tamanho:>1mb data:hoje conteudo:cláusula");
         assert_eq!(q.terms, vec!["relatorio".to_owned()]);
+        assert_eq!(q.content, vec!["cláusula".to_owned()]);
         assert_eq!(q.exts, vec!["pdf".to_owned(), "docx".to_owned()]);
         assert_eq!(q.kind, Some(KindSel::File));
         assert_eq!(q.min_size, Some(1024 * 1024));

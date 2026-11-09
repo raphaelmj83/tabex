@@ -1,17 +1,29 @@
 use crate::app::{Action, TabexApp};
 use crate::fs::entry::{format_date, format_size_kb, FileEntry};
+use crate::fs::ops;
 use crate::model::tab::{GroupBy, Row, SortKey, Tab};
+use crate::ui::dnd::{self, FileDrag};
 use crate::ui::theme::accent;
-use egui::{vec2, Align, Align2, Button, FontId, Label, Layout, Modifiers, RichText, Sense, Stroke, StrokeKind, Ui};
+use egui::{
+    vec2, Align, Align2, Button, Color32, CornerRadius, FontId, Key, Label, Layout, Modifiers, Pos2, Rect, RichText,
+    Sense, Stroke, StrokeKind, TextEdit, Ui,
+};
 use egui_extras::{Column, TableBuilder};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-enum RowEvent {
+pub enum RowEvent {
     Click(usize, Modifiers),
     Double(usize, Modifiers),
     Secondary(usize),
     Middle(usize),
+    DragStart(usize),
+}
+
+/// Resultado da edição inline de nome.
+enum RenameEvent {
+    Commit,
+    Cancel,
 }
 
 pub fn show(ui: &mut Ui, app: &mut TabexApp) {
@@ -27,10 +39,16 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     let has_clip = app.clipboard.is_some() || app.sys_clip_has_files;
     let pinned: Vec<PathBuf> = app.session.pinned.clone();
     let native = app.native_menu_enabled();
+    let view_icons = app.session.view_icons;
+    let thumbs = app.thumbs.as_ref();
     let tab: &mut Tab = &mut app.session.groups[g].tabs[t];
 
     let bg_rect = ui.max_rect();
-    let bg = ui.interact(bg_rect, ui.scope_id().with(("list_bg", tab.id)), Sense::click());
+    let bg = ui.interact(
+        bg_rect,
+        ui.scope_id().with(("list_bg", tab.id)),
+        Sense::click_and_drag(),
+    );
 
     if let Some(err) = tab.error.clone() {
         ui.centered_and_justified(|ui| {
@@ -51,7 +69,6 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     }
 
     let searching = tab.is_searching();
-    let row_h = 24.0;
     let scroll_to = if tab.scroll_to_cursor {
         tab.scroll_to_cursor = false;
         tab.cursor_row()
@@ -59,16 +76,42 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
         None
     };
 
+    // Estado da edição inline (copiado para dentro das closures da tabela).
+    let mut rename_text: Option<(PathBuf, String, bool)> = tab.inline_rename.clone();
+    let mut rename_event: Option<RenameEvent> = None;
     let mut events: Vec<RowEvent> = Vec::new();
-    {
+    let mut row_rects: Vec<(usize, Rect)> = Vec::new();
+    let rubber = tab.rubber.map(|start| {
+        let now = ui.input(|i| i.pointer.interact_pos()).unwrap_or(start);
+        Rect::from_two_pos(start, now)
+    });
+
+    if view_icons {
+        crate::ui::gridview::show(
+            ui,
+            tab,
+            dark,
+            &cut_set,
+            &mut events,
+            &mut actions,
+            &mut row_rects,
+            app.thumbs.as_ref(),
+        );
+        if !native {
+            // Menu de contexto por item na grade: reutiliza o menu de linha sobre a seleção atual.
+            let _ = (&has_clip, &pinned);
+        }
+    } else {
         let tab_ref: &Tab = tab;
         let source = tab_ref.source();
+        let row_h = 24.0;
         let mut builder = TableBuilder::new(ui)
             .id_salt(("filelist", tab_ref.id))
             .striped(false)
             .resizable(true)
             .auto_shrink([false, false])
-            .sense(Sense::click())
+            .drag_to_scroll(egui::scroll_area::DragScroll::Never)
+            .sense(Sense::click_and_drag())
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::remainder().at_least(200.0).clip(true))
             .column(Column::initial(150.0).at_least(90.0).clip(true))
@@ -142,11 +185,9 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                             }
                             let r = row.response();
                             let y = r.rect.bottom() - 1.0;
-                            ui_line(
-                                r.ctx.clone(),
-                                r.layer_id,
+                            r.ctx.layer_painter(r.layer_id).line_segment(
                                 [egui::pos2(r.rect.left() + 8.0, y), egui::pos2(r.rect.right() - 8.0, y)],
-                                Stroke::new(1.0, egui::Color32::from_gray(if dark { 60 } else { 225 })),
+                                Stroke::new(1.0, Color32::from_gray(if dark { 60 } else { 225 })),
                             );
                         }
                         Row::Entry(i) => {
@@ -154,6 +195,7 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                             let selected = tab_ref.selected.contains(&e.path);
                             row.set_selected(selected);
                             let is_cut = cut_set.contains(&e.path);
+                            let editing = rename_text.as_ref().map(|(p, _, _)| p == &e.path).unwrap_or(false);
                             row.col(|ui| {
                                 let color = if is_cut {
                                     ui.visuals().weak_text_color()
@@ -161,13 +203,37 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                                     ui.visuals().text_color()
                                 };
                                 ui.add_space(6.0);
-                                crate::ui::icons::show(ui, e.kind, 17.0, dark);
+                                crate::ui::icons::entry(ui, e, 17.0, dark, thumbs);
                                 ui.add_space(2.0);
-                                ui.add(
-                                    Label::new(RichText::new(&e.name).color(color))
-                                        .truncate()
-                                        .selectable(false),
-                                );
+                                if editing {
+                                    if let Some((_, text, first)) = rename_text.as_mut() {
+                                        let id = egui::Id::unique(("inline_rename", tab_ref.id));
+                                        let resp = ui.add(
+                                            TextEdit::singleline(text)
+                                                .id(id)
+                                                .desired_width(ui.available_width() - 8.0)
+                                                .margin(egui::Margin::symmetric(4, 1)),
+                                        );
+                                        if *first {
+                                            resp.request_focus();
+                                            crate::ui::dialogs::select_stem(ui.ctx(), id, text, !e.is_dir);
+                                            *first = false;
+                                        }
+                                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                                        let esc = ui.input(|i| i.key_pressed(Key::Escape));
+                                        if esc {
+                                            rename_event = Some(RenameEvent::Cancel);
+                                        } else if enter || (resp.lost_focus() && !*first) {
+                                            rename_event = Some(RenameEvent::Commit);
+                                        }
+                                    }
+                                } else {
+                                    ui.add(
+                                        Label::new(RichText::new(&e.name).color(color))
+                                            .truncate()
+                                            .selectable(false),
+                                    );
+                                }
                             });
                             row.col(|ui| {
                                 ui.add_space(6.0);
@@ -204,6 +270,7 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                                 });
                             }
                             let resp = row.response();
+                            row_rects.push((*i, resp.rect));
                             if tab_ref.cursor.as_deref() == Some(e.path.as_path()) {
                                 resp.ctx.layer_painter(resp.layer_id).rect_stroke(
                                     resp.rect.shrink(0.5),
@@ -212,19 +279,8 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                                     StrokeKind::Inside,
                                 );
                             }
-                            let mods = resp.ctx.input(|i| i.modifiers);
-                            if resp.double_clicked() {
-                                events.push(RowEvent::Double(*i, mods));
-                            } else if resp.clicked() {
-                                events.push(RowEvent::Click(*i, mods));
-                            }
-                            if resp.secondary_clicked() {
-                                events.push(RowEvent::Secondary(*i));
-                            }
-                            if resp.middle_clicked() {
-                                events.push(RowEvent::Middle(*i));
-                            }
-                            if !native {
+                            row_interactions(&resp, *i, e, tab_ref, editing, &mut events, &mut actions);
+                            if !native && !editing {
                                 resp.context_menu(|ui| item_menu(ui, e, tab_ref, has_clip, &pinned, &mut actions));
                             }
                         }
@@ -233,9 +289,11 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
             });
     }
 
-    // Estados vazios
+    // Estados vazios / carregando
     if tab.rows.is_empty() {
-        let msg = if let Some(s) = &tab.search {
+        let msg = if tab.is_loading() {
+            "Carregando…"
+        } else if let Some(s) = &tab.search {
             if s.done {
                 "Nenhum item corresponde à pesquisa."
             } else {
@@ -253,6 +311,39 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
             FontId::proportional(15.0),
             ui.visuals().weak_text_color(),
         );
+    }
+
+    // Renomear inline: aplica resultado
+    match rename_event {
+        Some(RenameEvent::Commit) => {
+            if let Some((path, text, _)) = rename_text.take() {
+                let old = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if text.trim() != old && !text.trim().is_empty() {
+                    match ops::rename(&path, &text) {
+                        Ok(new_path) => {
+                            actions.push(Action::PushUndo(ops::UndoEntry::new(
+                                "renomear",
+                                ops::UndoKind::Rename {
+                                    from: path.clone(),
+                                    to: new_path.clone(),
+                                },
+                            )));
+                            tab.selected.clear();
+                            tab.selected.insert(new_path.clone());
+                            tab.cursor = Some(new_path);
+                            tab.needs_reload = true;
+                        }
+                        Err(e) => actions.push(Action::Toast(format!("Não foi possível renomear: {e}"))),
+                    }
+                }
+            }
+            tab.inline_rename = None;
+        }
+        Some(RenameEvent::Cancel) => tab.inline_rename = None,
+        None => tab.inline_rename = rename_text,
     }
 
     // Aplica eventos das linhas
@@ -307,11 +398,65 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
                     }
                 }
             }
+            RowEvent::DragStart(i) => {
+                clicked_row = true;
+                if let Some(e) = tab.entry(i) {
+                    if !tab.selected.contains(&e.path) {
+                        tab.select_only(i);
+                    }
+                }
+                let paths = tab.selected_paths();
+                if !paths.is_empty() {
+                    egui::DragAndDrop::set_payload(
+                        ui.ctx(),
+                        FileDrag {
+                            paths,
+                            from: tab.path.clone(),
+                        },
+                    );
+                }
+            }
         }
     }
+
+    // Seleção por retângulo (arrasto a partir do fundo)
+    if bg.drag_started() && !egui::DragAndDrop::has_any_payload(ui.ctx()) {
+        tab.rubber = ui.input(|i| i.pointer.interact_pos());
+        tab.rubber_base = if ui.input(|i| i.modifiers.command) {
+            tab.selected.clone()
+        } else {
+            HashSet::new()
+        };
+    }
+    if let (Some(rect), true) = (rubber, tab.rubber.is_some()) {
+        ui.painter().rect(
+            rect,
+            CornerRadius::ZERO,
+            ui.visuals().selection.bg_fill.linear_multiply(0.5),
+            Stroke::new(1.0, ui.visuals().hyperlink_color),
+            StrokeKind::Inside,
+        );
+        let mut sel = tab.rubber_base.clone();
+        for (i, r) in &row_rects {
+            if r.intersects(rect) {
+                if let Some(e) = tab.entry(*i) {
+                    sel.insert(e.path.clone());
+                }
+            }
+        }
+        tab.selected = sel;
+    }
+    if bg.drag_stopped() || (tab.rubber.is_some() && !ui.input(|i| i.pointer.primary_down())) {
+        tab.rubber = None;
+    }
+
     if bg.clicked() && !clicked_row {
         tab.clear_selection();
+        tab.inline_rename = None;
     }
+    // Soltar arquivos no fundo da lista = colar nesta pasta
+    dnd::drop_target(ui, &bg, &tab.path.clone(), &mut actions);
+
     if native {
         if bg.secondary_clicked() && !clicked_row {
             actions.push(Action::NativeMenu {
@@ -326,11 +471,75 @@ pub fn show(ui: &mut Ui, app: &mut TabexApp) {
     app.pending.extend(actions);
 }
 
-fn ui_line(ctx: egui::Context, layer: egui::LayerId, points: [egui::Pos2; 2], stroke: Stroke) {
-    ctx.layer_painter(layer).line_segment(points, stroke);
+/// Cliques, arrasto e alvo de soltura de uma linha/célula de item.
+pub fn row_interactions(
+    resp: &egui::Response,
+    i: usize,
+    e: &FileEntry,
+    tab: &Tab,
+    editing: bool,
+    events: &mut Vec<RowEvent>,
+    actions: &mut Vec<Action>,
+) {
+    if editing {
+        return;
+    }
+    let mods = resp.ctx.input(|i| i.modifiers);
+    if resp.double_clicked() {
+        events.push(RowEvent::Double(i, mods));
+    } else if resp.clicked() {
+        events.push(RowEvent::Click(i, mods));
+    }
+    if resp.secondary_clicked() {
+        events.push(RowEvent::Secondary(i));
+    }
+    if resp.middle_clicked() {
+        events.push(RowEvent::Middle(i));
+    }
+    if resp.drag_started() {
+        events.push(RowEvent::DragStart(i));
+    }
+    // Pastas aceitam soltar arquivos.
+    if e.is_dir && !tab.selected.contains(&e.path) {
+        if let Some(p) = resp.dnd_hover_payload::<FileDrag>() {
+            if !p.paths.iter().any(|x| x == &e.path) {
+                resp.ctx.layer_painter(resp.layer_id).rect_stroke(
+                    resp.rect.shrink(1.0),
+                    CornerRadius::same(4),
+                    Stroke::new(2.0, resp.ctx.global_style().visuals.hyperlink_color),
+                    StrokeKind::Inside,
+                );
+            }
+        }
+        if let Some(p) = resp.dnd_release_payload::<FileDrag>() {
+            if !p.paths.iter().any(|x| x == &e.path) {
+                let mods = resp.ctx.input(|i| i.modifiers);
+                let cut = if mods.shift {
+                    true
+                } else if mods.command {
+                    false
+                } else {
+                    same_volume(&p.from, &e.path)
+                };
+                actions.push(Action::DropFiles {
+                    paths: p.paths.clone(),
+                    dest: e.path.clone(),
+                    cut,
+                });
+            }
+        }
+    }
 }
 
-fn item_menu(ui: &mut Ui, e: &FileEntry, tab: &Tab, has_clip: bool, pinned: &[PathBuf], actions: &mut Vec<Action>) {
+fn same_volume(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let root = |p: &std::path::Path| match p.components().next() {
+        Some(std::path::Component::Prefix(pr)) => pr.as_os_str().to_string_lossy().to_lowercase(),
+        _ => "/".to_owned(),
+    };
+    root(a) == root(b)
+}
+
+pub fn item_menu(ui: &mut Ui, e: &FileEntry, tab: &Tab, has_clip: bool, pinned: &[PathBuf], actions: &mut Vec<Action>) {
     ui.set_min_width(240.0);
     let multi = tab.selected.len() > 1 && tab.selected.contains(&e.path);
     if ui.add(Button::new("Abrir").shortcut_text("Enter")).clicked() {
@@ -342,6 +551,9 @@ fn item_menu(ui: &mut Ui, e: &FileEntry, tab: &Tab, has_clip: bool, pinned: &[Pa
         }
         if ui.button("Abrir em novo grupo").clicked() {
             actions.push(Action::OpenInNewGroup(e.path.clone()));
+        }
+        if ui.button("Abrir em nova janela").clicked() {
+            actions.push(Action::OpenInNewWindow(e.path.clone()));
         }
     }
     ui.separator();
@@ -396,7 +608,7 @@ fn item_menu(ui: &mut Ui, e: &FileEntry, tab: &Tab, has_clip: bool, pinned: &[Pa
     }
 }
 
-fn background_menu(bg: &egui::Response, tab: &Tab, has_clip: bool, pinned: &[PathBuf], actions: &mut Vec<Action>) {
+pub fn background_menu(bg: &egui::Response, tab: &Tab, has_clip: bool, pinned: &[PathBuf], actions: &mut Vec<Action>) {
     let path = tab.path.clone();
     let sort_key = tab.sort_key;
     let group_by = tab.group_by;
@@ -459,5 +671,5 @@ fn background_menu(bg: &egui::Response, tab: &Tab, has_clip: bool, pinned: &[Pat
             actions.push(Action::PropertiesOfFolder);
         }
     });
-    let _ = vec2(0.0, 0.0);
+    let _ = (vec2(0.0, 0.0), Pos2::ZERO);
 }

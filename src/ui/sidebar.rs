@@ -216,6 +216,7 @@ fn item(ui: &mut Ui, icon: Icon, label: &str, path: &Path, current: &Path, is_pi
             .selectable(false),
     );
     let resp = resp.on_hover_text(path.to_string_lossy());
+    crate::ui::dnd::drop_target(ui, &resp, path, actions);
     if resp.clicked() {
         actions.push(Action::Navigate(path.to_path_buf()));
     }

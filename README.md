@@ -9,9 +9,10 @@ todos com nome e cor, para organizar tudo o que você tem aberto.
 ![Tabex – tema claro](docs/screenshot-light.png)
 
 <details>
-<summary>Tema escuro</summary>
+<summary>Tema escuro e visualização em ícones com painel de visualização</summary>
 
 ![Tabex – tema escuro](docs/screenshot-dark.png)
+![Tabex – ícones grandes e painel de visualização](docs/screenshot-icons.png)
 </details>
 
 ## Instalação no Windows (C:\tabex)
@@ -48,6 +49,15 @@ ficam em `C:\tabex\session.json`, separadas em cada máquina. Fora desse caso el
 - Arraste abas entre grupos ou para reordenar; arraste até "＋ Grupo" para criar um grupo novo.
 - Menu de contexto na aba: duplicar, mover para grupo/janela, fechar outras, fechar à direita.
 - Reabrir aba fechada (Ctrl+Shift+T). A sessão é salva automaticamente.
+
+**Visualização e arquivos**
+- Modos **Detalhes** e **Ícones grandes** (Ctrl+Shift+6 / Ctrl+Shift+2) com miniaturas de imagens; no Windows, ícones reais do sistema por tipo de arquivo e miniaturas do shell (inclusive PDF).
+- **Painel de visualização** (Alt+P): imagem, texto (txt, código, csv…), informações do item; miniatura de PDF no Windows.
+- **Arrastar e soltar**: arraste arquivos para pastas da lista, para abas, grupos, janelas e para o painel lateral (move no mesmo disco, copia entre discos; Ctrl copia, Shift move). Solte arquivos vindos do Explorer na lista para copiar (Shift move). No Windows, arraste do Tabex para o Explorer, Outlook e outros programas.
+- Renomear **direto na lista** (F2), seleção por **retângulo** arrastando no vazio, listagem de pastas grandes em segundo plano, atualização instantânea quando a pasta muda (notify).
+- Ao colar sobre nomes existentes, o Tabex pergunta: **Substituir, Pular ou Manter ambos**; operações podem ser **canceladas** e entram numa **fila** (uma por vez).
+- Pesquisa **dentro dos arquivos** (menu Filtrar › "Pesquisar dentro dos arquivos" ou prefixo `conteudo:palavra`), limitada a arquivos de texto até 20 MB.
+- **Janelas separadas**: no menu de uma janela, "Abrir em janela separada" cria uma janela real do sistema com aquele espaço de trabalho (para dois monitores, por exemplo); "Trazer de volta" reanexa.
 
 **Nuvem e menu nativo**
 - Painel lateral com a seção **Nuvem**: detecta automaticamente OneDrive (pessoal e comercial), Dropbox
@@ -121,7 +131,7 @@ nenhuma dependência extra. No Linux (Debian/Ubuntu) instale antes:
 sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev
 ```
 
-Testes:
+Testes (unitários e de interface com `egui_kittest`, sem GPU):
 
 ```bash
 cargo test
@@ -148,20 +158,19 @@ src/
   shortcuts.rs       tabela de atalhos de teclado
   update.rs          verificação/instalação de atualizações (releases do GitHub)
   model/             sessão persistida: janelas, grupos, abas, cores
-  fs/                listagem, tipos, filtros/consulta, pesquisa recursiva, operações (com desfazer), nuvem, área de transferência
-  platform/          menu de contexto do shell do Windows (IContextMenu)
-  ui/                janelas, abas, barra de ferramentas, painel lateral, lista, status, diálogos, tema, ícones
+  fs/                listagem, tipos, filtros/consulta, pesquisa recursiva (nome e conteúdo), operações (desfazer, conflitos, fila), nuvem, área de transferência, miniaturas
+  platform/          menu de contexto do shell do Windows (IContextMenu) e arrastar para fora (OLE)
+  ui/                janelas, abas, barra de ferramentas, painel lateral, lista/grade, visualização, status, diálogos, tema, ícones, arrastar e soltar
+tests/               testes de interface (egui_kittest)
 installer/           instalar.bat / atualizar.bat (C:\tabex)
 assets/              ícone (pasta azul) e gerador
 ```
 
 ## Roteiro
 
-- Janelas como janelas reais do sistema (viewports), além dos espaços de trabalho
-- Visualizações em ícones grandes/miniaturas
-- Painel de visualização (preview) de imagens e texto
-- Arrastar e soltar arquivos entre abas
-- Ícones nativos do sistema para tipos de arquivo
+- Usar o índice do Windows Search na pesquisa
+- Miniaturas de vídeo e de documentos fora do Windows
+- Arrastar arquivos entre janelas separadas
 
 ## Licença
 

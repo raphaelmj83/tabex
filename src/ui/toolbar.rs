@@ -27,6 +27,8 @@ fn command_bar(ui: &mut Ui, app: &mut TabexApp, actions: &mut Vec<Action>) {
     let hidden = app.session.show_hidden;
     let dark = app.session.dark_theme;
     let native_menu = app.session.use_native_menu;
+    let view_icons = app.session.view_icons;
+    let preview = app.session.preview_visible;
     let native_supported = crate::platform::native_menu_supported();
     let update_available = matches!(app.updater.state(), crate::update::UpdateState::Available(_));
 
@@ -113,10 +115,29 @@ fn command_bar(ui: &mut Ui, app: &mut TabexApp, actions: &mut Vec<Action>) {
 
         ui.menu_button("▦ Visualizar", |ui| {
             if ui
+                .add(Button::new(check(!view_icons, "Detalhes")).shortcut_text("Ctrl+Shift+6"))
+                .clicked()
+            {
+                actions.push(Action::SetViewIcons(false));
+            }
+            if ui
+                .add(Button::new(check(view_icons, "Ícones grandes")).shortcut_text("Ctrl+Shift+2"))
+                .clicked()
+            {
+                actions.push(Action::SetViewIcons(true));
+            }
+            ui.separator();
+            if ui
                 .add(Button::new(check(sidebar, "Painel de navegação")).shortcut_text("Ctrl+B"))
                 .clicked()
             {
                 actions.push(Action::ToggleSidebar);
+            }
+            if ui
+                .add(Button::new(check(preview, "Painel de visualização")).shortcut_text("Alt+P"))
+                .clicked()
+            {
+                actions.push(Action::TogglePreview);
             }
             if ui
                 .add(Button::new(check(hidden, "Itens ocultos")).shortcut_text("Ctrl+H"))
@@ -406,6 +427,7 @@ fn select_all_text(ui: &Ui, id: egui::Id, len: usize) {
 fn search_box(ui: &mut Ui, app: &mut TabexApp, width: f32, actions: &mut Vec<Action>) {
     let folder = app.session.active_tab().title();
     let show_hidden = app.session.show_hidden;
+    let content_mode = app.session.search_content;
     let tab = app.session.active_tab_mut();
     let filter_active = tab.quick_filter.is_active();
     let frame = field_frame(ui);
@@ -445,12 +467,13 @@ fn search_box(ui: &mut Ui, app: &mut TabexApp, width: f32, actions: &mut Vec<Act
             if tab.search_text.trim().is_empty() {
                 tab.clear_search();
             } else {
-                tab.start_search(show_hidden);
+                tab.start_search_mode(show_hidden, content_mode);
             }
         }
         let _ = resp.on_hover_text(
             "Filtra enquanto digita. Enter pesquisa nas subpastas.\n\
-             Prefixos: ext:pdf  tipo:pasta  tipo:imagem  tamanho:>1mb  data:hoje",
+             Prefixos: ext:pdf  tipo:pasta  tipo:imagem  tamanho:>1mb  data:hoje  conteudo:palavra\n\
+             Curingas: *.pdf  relat*  foto_??.jpg",
         );
         if clear_w > 0.0
             && ui
@@ -509,6 +532,18 @@ fn search_box(ui: &mut Ui, app: &mut TabexApp, width: f32, actions: &mut Vec<Act
                             tab.quick_filter.size = s;
                             changed = true;
                         }
+                    }
+                    ui.separator();
+                    ui.strong("Pesquisa (Enter)");
+                    let mut cm = content_mode;
+                    if ui
+                        .checkbox(&mut cm, "Pesquisar dentro dos arquivos")
+                        .on_hover_text(
+                            "Os termos também são procurados no texto dos arquivos (txt, código, csv…). Mais lento.",
+                        )
+                        .changed()
+                    {
+                        actions.push(Action::ToggleSearchContent);
                     }
                     ui.separator();
                     if ui
