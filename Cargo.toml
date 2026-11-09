@@ -1,6 +1,6 @@
 [package]
 name = "tabex"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Gerenciador de arquivos com abas e grupos de abas coloridos, inspirado no Explorador de Arquivos do Windows"
 license = "MIT"

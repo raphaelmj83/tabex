@@ -180,6 +180,21 @@ pub fn asset_suffix() -> &'static str {
     }
 }
 
+/// Agente HTTP com o provedor TLS certo: nativo (Schannel) no Windows, rustls nos demais.
+/// O padrão do `ureq` é rustls, que não está compilado no Windows e causava pânico.
+fn agent() -> ureq::Agent {
+    use ureq::tls::{TlsConfig, TlsProvider};
+    let provider = if cfg!(windows) {
+        TlsProvider::NativeTls
+    } else {
+        TlsProvider::Rustls
+    };
+    let config = ureq::Agent::config_builder()
+        .tls_config(TlsConfig::builder().provider(provider).build())
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 fn user_agent() -> String {
     format!("tabex/{CURRENT} (+https://github.com/{REPO})")
 }
@@ -198,7 +213,8 @@ fn friendly(e: ureq::Error) -> String {
 
 fn fetch_latest(token: Option<&str>) -> Result<ReleaseInfo, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let mut req = ureq::get(&url)
+    let mut req = agent()
+        .get(&url)
         .header("User-Agent", user_agent())
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28");
@@ -245,7 +261,8 @@ pub fn parse_release(json: &str) -> Result<ReleaseInfo, String> {
 }
 
 fn download(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
-    let mut req = ureq::get(url)
+    let mut req = agent()
+        .get(url)
         .header("User-Agent", user_agent())
         .header("Accept", "application/octet-stream")
         .header("X-GitHub-Api-Version", "2022-11-28");
